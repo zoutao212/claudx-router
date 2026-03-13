@@ -466,7 +466,7 @@ async function getServer(options: RunOptions = {}) {
         if (payload.error) {
           return done(payload.error, null)
         } else {
-          return done(payload, null)
+          return done(null, payload)
         }
       }
     }

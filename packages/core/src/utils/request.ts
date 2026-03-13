@@ -1,6 +1,10 @@
 import { ProxyAgent } from "undici";
 import { UnifiedChatRequest } from "../types/llm";
 import { redactHeaders, traceLog, traceStream } from "./trace-logger";
+import { createHash } from "node:crypto";
+
+let lastRequestBodySha256: string | null = null;
+let lastRequestBodySha256AtMs = 0;
 
 export function sendUnifiedRequest(
   url: URL | string,
@@ -59,11 +63,27 @@ export function sendUnifiedRequest(
       new URL(config.httpsProxy).toString()
     );
   }
+
+  const bodyStr = typeof fetchOptions.body === "string" ? fetchOptions.body : "";
+  const bodyByteLength = Buffer.byteLength(bodyStr, "utf8");
+  const bodySha256 = createHash("sha256").update(bodyStr).digest("hex");
+  const nowMs = Date.now();
+  const possible_retry =
+    lastRequestBodySha256 === bodySha256 && nowMs - lastRequestBodySha256AtMs <= 5_000;
+  lastRequestBodySha256 = bodySha256;
+  lastRequestBodySha256AtMs = nowMs;
+
   logger?.debug(
     {
       reqId: context.req.id,
       request: fetchOptions,
       headers: headerObject,
+      bodyByteLength,
+      bodySha256,
+      retryHint: {
+        possible_retry,
+        windowMs: 5_000,
+      },
       requestUrl: typeof url === "string" ? url : url.toString(),
       useProxy: config.httpsProxy,
     },

@@ -31,9 +31,9 @@ echo Starting development server...
 echo ========================================
 echo.
 echo Server will be available at:
-echo   - API Endpoint: http://127.0.0.1:8080/v1/messages
-echo   - Web UI: http://127.0.0.1:8080
-echo   - Config API: http://127.0.0.1:8080/api/config
+echo   - API Endpoint: http://127.0.0.1:8082/v1/messages
+echo   - Web UI: http://127.0.0.1:8082
+echo   - Config API: http://127.0.0.1:8082/api/config
 echo   - Config: C:\Users\zouta\.claude-code-router\config.json
 echo.
 echo Trace logging enabled: CCR_TRACE=1
@@ -44,6 +44,7 @@ echo ========================================
 echo.
 
 set CCR_TRACE=1
+set SERVICE_PORT=8082
 pnpm.cmd dev:server
 
 pause
