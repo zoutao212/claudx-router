@@ -49,6 +49,7 @@ interface ResponsesStreamEvent {
   type: string;
   item_id?: string;
   output_index?: number;
+  arguments?: string;
   annotation?: ResponsesAPIAnnotation;
   part?: {
     type?: string;
@@ -222,7 +223,7 @@ export class OpenAIResponsesTransformer implements Transformer {
       }
     }
 
-    request.parallel_tool_calls = false;
+    (request as any).parallel_tool_calls = false;
 
     return {
       body: request,
@@ -269,6 +270,8 @@ export class OpenAIResponsesTransformer implements Transformer {
       const stream = new ReadableStream({
         async start(controller) {
           const reader = response.body!.getReader();
+          const toolArgsByItemId = new Map<string, string>();
+          const toolMetaByItemId = new Map<string, { id: string; name: string }>();
 
           // 索引跟踪变量，只有在事件类型切换时才增加索引
           let currentIndex = -1;
@@ -349,6 +352,12 @@ export class OpenAIResponsesTransformer implements Transformer {
                         data.item?.type === "function_call"
                       ) {
                         // 处理function call开始 - 创建初始的tool call chunk
+                        if (data.item.id) {
+                          toolMetaByItemId.set(data.item.id, {
+                            id: data.item.call_id || data.item.id,
+                            name: data.item.name || "",
+                          });
+                        }
                         const functionCallChunk = {
                           id:
                             data.item.call_id ||
@@ -470,6 +479,15 @@ export class OpenAIResponsesTransformer implements Transformer {
                         data.type === "response.function_call_arguments.delta"
                       ) {
                         // 处理function call参数增量
+                        if (data.item_id && typeof data.delta === "string") {
+                          toolArgsByItemId.set(
+                            data.item_id,
+                            (toolArgsByItemId.get(data.item_id) || "") + data.delta
+                          );
+                        }
+                        const toolMeta = data.item_id
+                          ? toolMetaByItemId.get(data.item_id)
+                          : undefined;
                         const functionCallChunk = {
                           id: data.item_id || "chatcmpl-" + Date.now(),
                           object: "chat.completion.chunk",
@@ -482,9 +500,12 @@ export class OpenAIResponsesTransformer implements Transformer {
                                 tool_calls: [
                                   {
                                     index: 0,
+                                    ...(toolMeta?.id ? { id: toolMeta.id } : {}),
                                     function: {
+                                      ...(toolMeta?.name ? { name: toolMeta.name } : {}),
                                       arguments: data.delta || "",
                                     },
+                                    ...(toolMeta ? { type: "function" } : {}),
                                   },
                                 ],
                               },
@@ -498,6 +519,62 @@ export class OpenAIResponsesTransformer implements Transformer {
                             `data: ${JSON.stringify(functionCallChunk)}\n\n`
                           )
                         );
+                      } else if (
+                        data.type === "response.function_call_arguments.done"
+                      ) {
+                        const finalArguments =
+                          typeof data.arguments === "string"
+                            ? data.arguments
+                            : "";
+                        const streamedArguments = data.item_id
+                          ? toolArgsByItemId.get(data.item_id) || ""
+                          : "";
+                        const toolMeta = data.item_id
+                          ? toolMetaByItemId.get(data.item_id)
+                          : undefined;
+                        const remainingArguments = finalArguments.startsWith(
+                          streamedArguments
+                        )
+                          ? finalArguments.slice(streamedArguments.length)
+                          : finalArguments;
+
+                        if (data.item_id) {
+                          toolArgsByItemId.set(data.item_id, finalArguments);
+                        }
+
+                        if (remainingArguments.length > 0) {
+                          const functionCallChunk = {
+                            id: data.item_id || "chatcmpl-" + Date.now(),
+                            object: "chat.completion.chunk",
+                            created: Math.floor(Date.now() / 1000),
+                            model: data.response?.model || "gpt-5-codex-",
+                            choices: [
+                              {
+                                index: getCurrentIndex(data.type),
+                                delta: {
+                                  tool_calls: [
+                                    {
+                                      index: 0,
+                                      ...(toolMeta?.id ? { id: toolMeta.id } : {}),
+                                      function: {
+                                        ...(toolMeta?.name ? { name: toolMeta.name } : {}),
+                                        arguments: remainingArguments,
+                                      },
+                                      ...(toolMeta ? { type: "function" } : {}),
+                                    },
+                                  ],
+                                },
+                                finish_reason: null,
+                              },
+                            ],
+                          };
+
+                          controller.enqueue(
+                            encoder.encode(
+                              `data: ${JSON.stringify(functionCallChunk)}\n\n`
+                            )
+                          );
+                        }
                       } else if (data.type === "response.completed") {
                         // 发送结束标记 - 检查是否是tool_calls完成
                         const finishReason = data.response?.output?.some(

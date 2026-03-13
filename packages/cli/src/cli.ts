@@ -136,6 +136,8 @@ async function main() {
         const port = globalConfig.PORT || 3456;
         envOverrides = {
           ...envOverrides,
+          ANTHROPIC_API_KEY: globalConfig.APIKEY || "test",
+          ANTHROPIC_AUTH_TOKEN: globalConfig.APIKEY || "test",
           ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}/preset/${command}`,
         };
       } else if (provider) {
@@ -157,6 +159,7 @@ async function main() {
         if (provider.api_key) {
           envOverrides = {
             ...envOverrides,
+            ANTHROPIC_API_KEY: provider.api_key,
             ANTHROPIC_AUTH_TOKEN: provider.api_key,
           };
         }
