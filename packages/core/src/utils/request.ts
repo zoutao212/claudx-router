@@ -128,17 +128,18 @@ export function sendUnifiedRequest(
             },
             "upstream_retry"
           );
-
-          // Drain/close body quickly to free resources before retry
-          try {
-            response.body?.cancel();
-          } catch {}
-
           const elapsed = Date.now() - startMs;
           const delay = Math.min(retryBaseMs * Math.pow(2, attempt), 2_000);
           if (elapsed + delay > retryTotalMs) {
             return response;
           }
+
+          // Drain/close body quickly to free resources before retry
+          // IMPORTANT: only do this if we are actually going to retry.
+          try {
+            response.body?.cancel();
+          } catch {}
+
           await sleep(delay);
           continue;
         }

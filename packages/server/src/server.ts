@@ -26,7 +26,17 @@ import fastifyMultipart from "@fastify/multipart";
 import AdmZip from "adm-zip";
 
 export const createServer = async (config: any): Promise<any> => {
-  console.log('createServer called with config:', JSON.stringify(config, null, 2));
+  try {
+    const safeConfig = {
+      jsonPath: config?.jsonPath,
+      initialConfig: config?.initialConfig,
+      hasLogger: Boolean(config?.logger),
+      loggerType: typeof config?.logger,
+    };
+    console.log('createServer called with config:', JSON.stringify(safeConfig, null, 2));
+  } catch {
+    console.log('createServer called with config (safe log failed)');
+  }
   console.log('Creating Server instance...');
   const server = new Server(config);
   console.log('Server instance created successfully');

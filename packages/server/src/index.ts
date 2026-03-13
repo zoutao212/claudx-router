@@ -16,6 +16,7 @@ import { IAgent, ITool } from "./agents/type";
 import agentsManager from "./agents";
 import { EventEmitter } from "node:events";
 import { pluginManager, tokenSpeedPlugin } from "@musistudio/llms";
+import pino from "pino";
 
 const event = new EventEmitter()
 
@@ -149,44 +150,77 @@ async function getServer(options: RunOptions = {}) {
       if (config.LOG === undefined) {
         config.LOG = true;
       }
-      loggerConfig = {
-        level: config.LOG_LEVEL || "debug",
-        stream: createStream(generator, {
-          path: (() => {
-            const logDir = join(HOME_DIR, "logs");
-            try {
-              if (!existsSync(logDir)) {
-                // rotating-file-stream does not create nested folders automatically
-                mkdirSync(logDir, { recursive: true });
-              }
-            } catch {
-              // ignore
-            }
-            // Make logger destination visible in console (one-time at startup)
-            try {
-              console.log(`[ccr] logDir=${logDir}`);
-              console.log(`[ccr] logFileExample=${generator(new Date(), undefined)}`);
-            } catch {
-              // ignore
-            }
-            return logDir;
-          })(),
-          maxFiles: 3,
-          interval: "1d",
-          compress: false,
-          maxSize: "50M"
-        }),
-        // Add console output for important events
-        transport: {
-          target: 'pino-pretty',
-          options: {
-            colorize: false,
-            ignore: 'pid,hostname',
-            messageKey: 'msg',
-            translateTime: 'HH:mm:ss.SSS'
-          }
+      const logDir = join(HOME_DIR, "logs");
+      try {
+        if (!existsSync(logDir)) {
+          // rotating-file-stream does not create nested folders automatically
+          mkdirSync(logDir, { recursive: true });
         }
-      };
+      } catch {
+        // ignore
+      }
+
+      // Make logger destination visible in console (one-time at startup)
+      try {
+        console.log(`[ccr] logDir=${logDir}`);
+        console.log(`[ccr] logFileExample=${generator(new Date(), undefined)}`);
+      } catch {
+        // ignore
+      }
+
+      const fileStream = createStream(generator, {
+        path: logDir,
+        maxFiles: 3,
+        interval: "1d",
+        compress: false,
+        maxSize: "50M",
+      });
+
+      try {
+        fileStream.on("error", (err: unknown) => {
+          console.error("[ccr] file log stream error:", err);
+        });
+      } catch {
+        // ignore
+      }
+
+      const prettyStream = pino.transport({
+        target: "pino-pretty",
+        options: {
+          colorize: false,
+          ignore: "pid,hostname",
+          messageKey: "msg",
+          translateTime: "HH:mm:ss.SSS",
+        },
+      });
+
+      try {
+        (prettyStream as unknown as { on?: (evt: string, cb: (...args: any[]) => void) => void }).on?.(
+          "error",
+          (err: unknown) => {
+            console.error("[ccr] console log transport error:", err);
+          },
+        );
+      } catch {
+        // ignore
+      }
+
+      const level = config.LOG_LEVEL || "debug";
+      const stream = pino.multistream([
+        { stream: fileStream },
+        { stream: prettyStream },
+      ]);
+
+      // Fastify v5 expects either `true/false` or a logger configuration object.
+      // Provide a config object with a multistream destination to tee output.
+      loggerConfig = { level, stream };
+
+      try {
+        // Emit one log line to force a write so users can immediately verify file output.
+        pino({ level }, stream).info({ logDir }, "logger_initialized");
+      } catch {
+        // ignore
+      }
     } else {
       loggerConfig = false;
     }

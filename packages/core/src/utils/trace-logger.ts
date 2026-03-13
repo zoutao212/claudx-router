@@ -137,15 +137,39 @@ function consoleLog(record: TraceRecord, maxLen = 300): void {
   const phase = String(record.phase || "unknown");
   const ts = String(record.ts || new Date().toISOString());
 
+  const truncate = (s: string, n: number) => (s.length > n ? s.slice(0, n) + "..." : s);
+  const shortenPath = (s: string) => {
+    const normalized = s.replace(/\\/g, "/");
+    const parts = normalized.split("/").filter(Boolean);
+    if (parts.length <= 4) return normalized;
+    return parts.slice(0, 1).join("/") + "/.../" + parts.slice(-2).join("/");
+  };
+  const normalizeExtra = (obj: Record<string, unknown>): Record<string, unknown> => {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(obj)) {
+      if (typeof v === "string") {
+        const key = k.toLowerCase();
+        const maybePath = key.includes("path") || key.includes("file") || key.includes("filename") || key.includes("dir");
+        const s = maybePath ? shortenPath(v) : v;
+        out[k] = truncate(s, 140);
+      } else {
+        out[k] = v;
+      }
+    }
+    return out;
+  };
+
   const isSseChunk = phase.endsWith(":chunk") && phase.includes("sse");
   const isSseTerminal =
     (phase.endsWith(":done") || phase.endsWith(":cancel")) && phase.includes("sse");
 
   const getExtra = () =>
-    Object.fromEntries(
-      Object.entries(record).filter(
-        ([k]) => !["ts", "phase", "body", "bodyText", "text", "message"].includes(k)
-      )
+    normalizeExtra(
+      Object.fromEntries(
+        Object.entries(record).filter(
+          ([k]) => !["ts", "phase", "body", "bodyText", "text", "message"].includes(k)
+        )
+      ) as Record<string, unknown>
     );
 
   const flushKeyFromRecord = () => {
@@ -208,7 +232,8 @@ function consoleLog(record: TraceRecord, maxLen = 300): void {
   })();
 
   const extra = getExtra();
-  console.log(`[${ts}] ${phase}${Object.keys(extra).length ? " " + JSON.stringify(extra) : ""} | ${body}`);
+  const bodyOut = typeof body === "string" ? truncate(body, maxLen) : body;
+  console.log(`[${ts}] ${phase}${Object.keys(extra).length ? " " + JSON.stringify(extra) : ""} | ${bodyOut}`);
 }
 
 export function traceLog(record: TraceRecord): void {
