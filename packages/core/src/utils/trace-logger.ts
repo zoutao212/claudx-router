@@ -234,8 +234,10 @@ export function traceLog(record: TraceRecord): void {
     );
   }
 
-  // Also echo a truncated version to console for dev visibility
-  consoleLog(safe as TraceRecord);
+  // Also echo a truncated version to console for dev visibility (opt-in)
+  if (process.env.CCR_TRACE_CONSOLE === "1") {
+    consoleLog(safe as TraceRecord);
+  }
 }
 
 // Export a one-time init logger to help verify tracing works at startup

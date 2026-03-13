@@ -141,6 +141,8 @@ export class TransformerService {
     try {
       await this.registerDefaultTransformersInternal();
       await this.loadFromConfig();
+      // Force flush any remaining log messages
+      this.forceFlushLogs();
     } catch (error: any) {
       this.logger.error(
         `TransformerService init error: ${error.message}\nStack: ${error.stack}`

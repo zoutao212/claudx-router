@@ -747,28 +747,37 @@ export class OpenAIResponsesTransformer implements Transformer {
                         };
                         controller.enqueue(encoder.encode(`data: ${JSON.stringify(textChunk)}\n\n`));
                       } else {
-                        // 对于其他错误，传递原始行
-                        controller.enqueue(encoder.encode(line + "\n"));
+                        // 对于其他错误，过滤掉非 data: 行
+                        if (line.startsWith("data: ")) {
+                          controller.enqueue(encoder.encode(line + "\n"));
+                        }
                       }
                     }
                   } else {
-                    // 传递其他行
-                    controller.enqueue(encoder.encode(line + "\n"));
+                    // 过滤掉所有非 data: 行，包括 event: 行，确保只输出标准格式
+                    continue;
                   }
                 } catch (error) {
                   // 减少错误日志刷屏，只在调试模式下输出详细信息
                   if (transformer.logger?.debug) {
                     transformer.logger.debug("Error processing line:", line, error);
                   }
-                  // 如果解析失败，直接传递原始行
-                  controller.enqueue(encoder.encode(line + "\n"));
+                  // 如果解析失败，过滤掉非 data: 行，避免输出原始 event: 行
+                  if (line.startsWith("data: ")) {
+                    controller.enqueue(encoder.encode(line + "\n"));
+                  }
                 }
               }
             }
 
-            // 处理缓冲区中剩余的数据
+            // 处理缓冲区中剩余的数据，只保留 data: 行
             if (buffer.trim()) {
-              controller.enqueue(encoder.encode(buffer + "\n"));
+              const bufferLines = buffer.split(/\r?\n/);
+              for (const bufferLine of bufferLines) {
+                if (bufferLine.trim() && bufferLine.startsWith("data: ")) {
+                  controller.enqueue(encoder.encode(bufferLine + "\n"));
+                }
+              }
             }
 
             // 确保流结束时发送结束标记

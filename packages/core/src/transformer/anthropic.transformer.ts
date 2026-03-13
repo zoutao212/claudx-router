@@ -276,6 +276,25 @@ export class AnthropicTransformer implements Transformer {
         let contentIndex = 0;
         let currentContentBlockIndex = -1; // Track the current content block index
 
+        // Batch debug logging for upstream OpenAI chunks to avoid per-token log spam
+        let openaiChunkLogBuffer = "";
+        let openaiChunkLogLastFlushAt = 0;
+        const flushOpenAIChunkLog = (reason: "threshold" | "interval" | "terminal") => {
+          if (!openaiChunkLogBuffer) return;
+          if (!this.logger?.debug) {
+            openaiChunkLogBuffer = "";
+            return;
+          }
+          this.logger.debug({
+            reqId: context.req.id,
+            reason,
+            preview: openaiChunkLogBuffer,
+            type: "Original Response (batched)",
+          });
+          openaiChunkLogBuffer = "";
+          openaiChunkLogLastFlushAt = Date.now();
+        };
+
         // 原子性的content block index分配函数
         const assignContentBlockIndex = (): number => {
           const currentIndex = contentIndex;
@@ -287,26 +306,46 @@ export class AnthropicTransformer implements Transformer {
           if (!isClosed) {
             try {
               controller.enqueue(data);
-              const dataStr = new TextDecoder().decode(data);
-              this.logger.debug({
-                reqId: context.req.id,
-                data: dataStr,
-                type: "send data",
-              });
-            } catch (error) {
-              if (
-                error instanceof TypeError &&
-                error.message.includes("Controller is already closed")
-              ) {
-                isClosed = true;
-              } else {
+              if (process.env.CCR_LOG_SSE === "1") {
+                const dataStr = new TextDecoder().decode(data);
                 this.logger.debug({
                   reqId: context.req.id,
-                  error: error instanceof Error ? error.message : String(error),
-                  type: "send data error",
+                  data: dataStr,
+                  type: "send data",
                 });
-                throw error;
               }
+            } catch (error) {
+              const message =
+                error instanceof Error
+                  ? error.message
+                  : typeof error === "string"
+                    ? error
+                    : "";
+
+              // Client aborted / stream closed: do NOT throw (would surface as 500 to Claude Code).
+              // Mark closed and stop further enqueue attempts.
+              const isClosedLike =
+                (error instanceof TypeError &&
+                  message.includes("Controller is already closed")) ||
+                message.includes("Invalid state") ||
+                message.includes("Cannot enqueue") ||
+                message.includes("WritableStream is closed") ||
+                message.includes("write after end") ||
+                message.includes("EPIPE") ||
+                message.includes("ECONNRESET") ||
+                message.includes("socket hang up");
+
+              if (isClosedLike) {
+                isClosed = true;
+                return;
+              }
+
+              this.logger.debug({
+                reqId: context.req.id,
+                error: message || String(error),
+                type: "send data error",
+              });
+              throw error;
             }
           }
         };
@@ -376,8 +415,13 @@ export class AnthropicTransformer implements Transformer {
               ) {
                 isClosed = true;
               } else {
-                throw error;
+                console.error("Stream processing error:", error);
               }
+            } finally {
+              flushOpenAIChunkLog("terminal");
+              try {
+                reader?.releaseLock();
+              } catch {}
             }
           }
         };
@@ -406,11 +450,13 @@ export class AnthropicTransformer implements Transformer {
 
               if (!line.startsWith("data:")) continue;
               const data = line.slice(5).trim();
-              this.logger.debug({
-                reqId: context.req.id,
-                type: "recieved data",
-                data,
-              });
+              if (process.env.CCR_LOG_SSE === "1") {
+                this.logger.debug({
+                  reqId: context.req.id,
+                  type: "recieved data",
+                  data,
+                });
+              }
 
               if (data === "[DONE]") {
                 continue;
@@ -419,11 +465,27 @@ export class AnthropicTransformer implements Transformer {
               try {
                 const chunk = JSON.parse(data);
                 totalChunks++;
-                this.logger.debug({
-                  reqId: context.req.id,
-                  response: chunk,
-                  tppe: "Original Response",
-                });
+                // Aggregate token-level deltas into batched logs (200-300 chars) to reduce log size
+                try {
+                  const delta = chunk?.choices?.[0]?.delta;
+                  const piece: string | undefined =
+                    delta?.content ??
+                    delta?.thinking?.content ??
+                    (typeof chunk?.choices?.[0]?.delta === "string" ? chunk.choices[0].delta : undefined);
+                  if (typeof piece === "string" && piece.length > 0) {
+                    openaiChunkLogBuffer += piece;
+                  }
+                } catch {
+                  // ignore
+                }
+
+                const now = Date.now();
+                if (!openaiChunkLogLastFlushAt) openaiChunkLogLastFlushAt = now;
+                if (openaiChunkLogBuffer.length >= 260) {
+                  flushOpenAIChunkLog("threshold");
+                } else if (now - openaiChunkLogLastFlushAt >= 800) {
+                  flushOpenAIChunkLog("interval");
+                }
                 if (chunk.error) {
                   const errorMessage = {
                     type: "error",
@@ -517,7 +579,7 @@ export class AnthropicTransformer implements Transformer {
                   //   };
                   //   safeEnqueue(
                   //     encoder.encode(
-                  //       `event: content_block_stop\ndata: ${JSON.stringify(
+                  //       `data: ${JSON.stringify(
                   //         contentBlockStop
                   //       )}\n\n`
                   //     )
@@ -998,7 +1060,8 @@ export class AnthropicTransformer implements Transformer {
         choice.message.tool_calls.forEach((toolCall) => {
           let parsedInput = {};
           try {
-            const argumentsStr = toolCall.function.arguments || "{}";
+            const fn = (toolCall as any).function;
+            const argumentsStr = fn?.arguments || "{}";
 
             if (typeof argumentsStr === "object") {
               parsedInput = argumentsStr;
@@ -1006,13 +1069,14 @@ export class AnthropicTransformer implements Transformer {
               parsedInput = JSON.parse(argumentsStr);
             }
           } catch {
-            parsedInput = { text: toolCall.function.arguments || "" };
+            const fn = (toolCall as any).function;
+            parsedInput = { text: fn?.arguments || "" };
           }
 
           content.push({
             type: "tool_use",
             id: toolCall.id,
-            name: toolCall.function.name,
+            name: ((toolCall as any).function?.name as string) || "",
             input: parsedInput,
           });
         });

@@ -1,4 +1,4 @@
-import { existsSync } from "fs";
+import { existsSync, mkdirSync } from "fs";
 import { writeFile } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
@@ -134,7 +134,7 @@ async function getServer(options: RunOptions = {}) {
     const hour = pad(date.getHours());
     const minute = pad(date.getMinutes());
 
-    return `./logs/ccr-${month}${day}${hour}${minute}${pad(date.getSeconds())}${index ? `_${index}` : ''}.log`;
+    return `ccr-${month}${day}${hour}${minute}${pad(date.getSeconds())}${index ? `_${index}` : ''}.log`;
   };
 
   let loggerConfig: any;
@@ -152,7 +152,25 @@ async function getServer(options: RunOptions = {}) {
       loggerConfig = {
         level: config.LOG_LEVEL || "debug",
         stream: createStream(generator, {
-          path: HOME_DIR,
+          path: (() => {
+            const logDir = join(HOME_DIR, "logs");
+            try {
+              if (!existsSync(logDir)) {
+                // rotating-file-stream does not create nested folders automatically
+                mkdirSync(logDir, { recursive: true });
+              }
+            } catch {
+              // ignore
+            }
+            // Make logger destination visible in console (one-time at startup)
+            try {
+              console.log(`[ccr] logDir=${logDir}`);
+              console.log(`[ccr] logFileExample=${generator(new Date(), undefined)}`);
+            } catch {
+              // ignore
+            }
+            return logDir;
+          })(),
           maxFiles: 3,
           interval: "1d",
           compress: false,
@@ -242,6 +260,23 @@ async function getServer(options: RunOptions = {}) {
     }
   });
   serverInstance.addHook("onError", async (request: any, reply: any, error: any) => {
+    try {
+      const errObj = error as any;
+      request?.log?.error({
+        reqId: request?.id,
+        method: request?.method,
+        url: request?.url,
+        statusCode: reply?.statusCode,
+        errorName: errObj?.name,
+        errorCode: errObj?.code,
+        errorMessage:
+          typeof errObj?.message === "string" ? errObj.message : String(errObj),
+        errorStack: typeof errObj?.stack === "string" ? errObj.stack : undefined,
+        errorCause: errObj?.cause,
+      }, "request_error");
+    } catch {
+      // ignore logging failures
+    }
     event.emit('onError', request, reply, error);
   })
   serverInstance.addHook("onSend", (req: any, reply: any, payload: any, done: any) => {
@@ -342,14 +377,31 @@ async function getServer(options: RunOptions = {}) {
                     }
 
                     // Check if stream is still writable
-                    if (!controller.desiredSize) {
+                    if (controller.desiredSize === null) {
                       break;
                     }
 
-                    controller.enqueue(eventData)
+                    try {
+                      controller.enqueue(eventData)
+                    } catch (enqueueError: any) {
+                      const msg = enqueueError?.message || ''
+                      if (
+                        enqueueError?.name === 'AbortError' ||
+                        enqueueError?.code === 'ERR_STREAM_PREMATURE_CLOSE' ||
+                        (enqueueError instanceof TypeError && msg.includes('Controller is already closed'))
+                      ) {
+                        abortController.abort();
+                        break;
+                      }
+                      throw enqueueError;
+                    }
                   }catch (readError: any) {
                     if (readError.name === 'AbortError' || readError.code === 'ERR_STREAM_PREMATURE_CLOSE') {
                       abortController.abort(); // Abort all related operations
+                      break;
+                    }
+                    if (readError instanceof TypeError && (readError.message || '').includes('Controller is already closed')) {
+                      abortController.abort();
                       break;
                     }
                     throw readError;
@@ -363,7 +415,11 @@ async function getServer(options: RunOptions = {}) {
               console.error('Unexpected error in stream processing:', error);
 
               // Handle premature stream closure error
-              if (error.code === 'ERR_STREAM_PREMATURE_CLOSE') {
+              if (
+                error?.name === 'AbortError' ||
+                error?.code === 'ERR_STREAM_PREMATURE_CLOSE' ||
+                (error instanceof TypeError && (error.message || '').includes('Controller is already closed'))
+              ) {
                 abortController.abort();
                 return undefined;
               }
