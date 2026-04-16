@@ -17,6 +17,53 @@ import agentsManager from "./agents";
 import { EventEmitter } from "node:events";
 import { pluginManager, tokenSpeedPlugin } from "@musistudio/llms";
 import pino from "pino";
+import pinoPretty from "pino-pretty";
+
+ function formatMultilineBlock(value: unknown, indent = "", depth = 0): string {
+   const maxDepth = 6;
+   const nextIndent = indent + "  ";
+   const normalizeNewlines = (s: string) => s.replace(/\r\n/g, "\n");
+
+   if (value === null) return "null";
+   if (value === undefined) return "undefined";
+   if (typeof value === "number" || typeof value === "boolean") return String(value);
+   if (typeof value === "bigint") return `${value}n`;
+   if (typeof value === "string") {
+     const s = normalizeNewlines(value);
+     if (!s.includes("\n")) return JSON.stringify(s);
+     const lines = s.split("\n");
+     return `|\n${lines.map((l) => `${nextIndent}${l}`).join("\n")}`;
+   }
+
+   if (depth >= maxDepth) return '"<max_depth>"';
+
+   if (Array.isArray(value)) {
+     if (value.length === 0) return "[]";
+     const items = value
+       .map((v) => `${nextIndent}- ${formatMultilineBlock(v, nextIndent, depth + 1)}`)
+       .join("\n");
+     return `\n${items}`;
+   }
+
+   if (typeof value === "object") {
+     const obj = value as Record<string, unknown>;
+     const keys = Object.keys(obj);
+     if (keys.length === 0) return "{}";
+     const body = keys
+       .map((k) => {
+         const v = obj[k];
+         const rendered = formatMultilineBlock(v, nextIndent, depth + 1);
+         if (rendered.startsWith("|\n") || rendered.startsWith("\n")) {
+           return `${nextIndent}${k}: ${rendered}`;
+         }
+         return `${nextIndent}${k}: ${rendered}`;
+       })
+       .join("\n");
+     return `\n${body}`;
+   }
+
+   return JSON.stringify(String(value));
+ }
 
 const event = new EventEmitter()
 
@@ -184,13 +231,14 @@ async function getServer(options: RunOptions = {}) {
         // ignore
       }
 
-      const prettyStream = pino.transport({
-        target: "pino-pretty",
-        options: {
-          colorize: false,
-          ignore: "pid,hostname",
-          messageKey: "msg",
-          translateTime: "HH:mm:ss.SSS",
+      const prettyStream = pinoPretty({
+        colorize: false,
+        ignore: "pid,hostname",
+        messageKey: "msg",
+        translateTime: "HH:mm:ss.SSS",
+        customPrettifiers: {
+          data: (value: unknown) => formatMultilineBlock(value),
+          body: (value: unknown) => formatMultilineBlock(value),
         },
       });
 
@@ -198,7 +246,7 @@ async function getServer(options: RunOptions = {}) {
         (prettyStream as unknown as { on?: (evt: string, cb: (...args: any[]) => void) => void }).on?.(
           "error",
           (err: unknown) => {
-            console.error("[ccr] console log transport error:", err);
+            console.error("[ccr] console pretty stream error:", err);
           },
         );
       } catch {
