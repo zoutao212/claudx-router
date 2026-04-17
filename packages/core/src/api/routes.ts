@@ -326,6 +326,12 @@ function shouldBypassTransformers(
   transformer: any,
   body: any
 ): boolean {
+  // Never bypass when the request is in Responses API format (from Codex CLI).
+  // These requests need transformRequestOut to convert Responses API → Chat Completions,
+  // and transformRequestIn to rewrite the URL to /chat/completions.
+  if (body.input && !body.messages) {
+    return false;
+  }
   return (
     provider.transformer?.use?.length === 1 &&
     provider.transformer.use[0].name === transformer.name &&

@@ -85,10 +85,168 @@ export class OpenAIResponsesTransformer implements Transformer {
   logger?: any;
   private _encodingWarningLogged = false;
 
+  /**
+   * Convert incoming request from endpoint format to unified format.
+   * If the request is in Responses API format (has 'input' field, from Codex CLI),
+   * convert it to Chat Completions format.
+   * If the request is already in Chat Completions format (has 'messages' field),
+   * pass it through unchanged.
+   */
+  async transformRequestOut(
+    request: Record<string, any>
+  ): Promise<UnifiedChatRequest> {
+    // Detect if this is a Responses API format request (from Codex CLI)
+    if (request.input && !request.messages) {
+      return this.convertResponsesApiToChat(request);
+    }
+    // Already in Chat Completions format, pass through
+    return request as UnifiedChatRequest;
+  }
+
+  /**
+   * Convert Responses API format (from Codex CLI) to Chat Completions format.
+   */
+  private convertResponsesApiToChat(req: Record<string, any>): UnifiedChatRequest {
+    const messages: UnifiedMessage[] = [];
+
+    // Extract instructions as system message
+    if (req.instructions) {
+      messages.push({
+        role: "system",
+        content: typeof req.instructions === "string" ? req.instructions : JSON.stringify(req.instructions),
+      });
+    }
+
+    // Process input items
+    const inputItems = Array.isArray(req.input) ? req.input : [{ type: "input_text", text: req.input }];
+    for (const item of inputItems) {
+      const converted = this.convertInputItemToMessage(item);
+      if (converted) {
+        if (Array.isArray(converted)) {
+          messages.push(...converted);
+        } else {
+          messages.push(converted);
+        }
+      }
+    }
+
+    // Build tools in Chat Completions format
+    let tools: any[] | undefined;
+    if (Array.isArray(req.tools) && req.tools.length > 0) {
+      tools = req.tools
+        .filter((tool: any) => tool.type === "function")
+        .map((tool: any) => ({
+          type: "function",
+          function: {
+            name: tool.name,
+            description: tool.description || "",
+            parameters: tool.parameters || { type: "object", properties: {} },
+          },
+        }));
+    }
+
+    // Map reasoning effort
+    let reasoning: any = undefined;
+    if (req.reasoning?.effort) {
+      reasoning = {
+        effort: req.reasoning.effort as any,
+        enabled: true,
+      };
+    }
+
+    return {
+      messages,
+      model: req.model,
+      stream: req.stream,
+      tools: tools && tools.length > 0 ? tools : undefined,
+      reasoning,
+      temperature: req.temperature,
+      max_tokens: req.max_output_tokens,
+      _fromResponsesApi: true,
+    } as any;
+  }
+
+  /**
+   * Convert a single Responses API input item to a Chat Completions message.
+   */
+  private convertInputItemToMessage(item: any): UnifiedMessage | UnifiedMessage[] | null {
+    // User text input
+    if (item.type === "input_text" || (item.role === "user" && item.content && !item.type)) {
+      const text = item.text || (typeof item.content === "string" ? item.content : "");
+      if (text) {
+        return { role: "user", content: text };
+      }
+      if (Array.isArray(item.content)) {
+        return { role: "user", content: item.content };
+      }
+      return null;
+    }
+
+    // Assistant text output
+    if (item.type === "output_text" || (item.role === "assistant" && item.content && !item.type)) {
+      const text = item.text || (typeof item.content === "string" ? item.content : "");
+      return { role: "assistant", content: text };
+    }
+
+    // Function call (assistant tool call)
+    if (item.type === "function_call") {
+      return {
+        role: "assistant",
+        content: null,
+        tool_calls: [{
+          id: item.call_id || `call_${Date.now()}`,
+          type: "function" as const,
+          function: {
+            name: item.name || "",
+            arguments: item.arguments || "{}",
+          },
+        }],
+      };
+    }
+
+    // Function call output (tool result)
+    if (item.type === "function_call_output") {
+      return {
+        role: "tool",
+        content: item.output || "",
+        tool_call_id: item.call_id || "",
+      };
+    }
+
+    // Simple role-based message
+    if (item.role === "user" || item.role === "assistant") {
+      return {
+        role: item.role as "user" | "assistant",
+        content: typeof item.content === "string" ? item.content : JSON.stringify(item.content || ""),
+      };
+    }
+
+    return null;
+  }
+
   async transformRequestIn(
     request: UnifiedChatRequest,
     provider: LLMProvider
-  ): Promise<UnifiedChatRequest | { body: UnifiedChatRequest; config: { url: URL } }> {
+  ): Promise<UnifiedChatRequest | { body: UnifiedChatRequest; config: { url: URL; headers: Record<string, string> } }> {
+    // If this request was converted from Responses API format (Codex CLI),
+    // the upstream provider expects Chat Completions format.
+    // Skip the Responses API conversion and point URL to /chat/completions.
+    if ((request as any)._fromResponsesApi) {
+      delete (request as any)._fromResponsesApi;
+      return {
+        body: request,
+        config: {
+          url: this.buildChatCompletionsUrl(provider.baseUrl),
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Accept': 'text/event-stream, application/json, */*',
+          },
+        },
+      };
+    }
+
+    // Original logic: convert Chat Completions → Responses API format
+    // for upstream providers that support Responses API
     delete request.temperature;
     delete request.max_tokens;
 
@@ -272,6 +430,8 @@ export class OpenAIResponsesTransformer implements Transformer {
       const encoder = new TextEncoder();
       let buffer = ""; // 用于缓冲不完整的数据
       let isStreamEnded = false;
+      let isChatCompletionsFormat = false; // Detect if upstream returns Chat Completions format
+      let hasCheckedFormat = false;
 
       const transformer = this;
       const stream = new ReadableStream({
@@ -381,6 +541,25 @@ export class OpenAIResponsesTransformer implements Transformer {
                       // 如果安全解析返回null，说明需要更多数据，将数据保留在缓冲区
                       if (data === null) {
                         buffer = "data: " + dataStr + "\n" + buffer;
+                        continue;
+                      }
+
+                      // Auto-detect format: if the stream contains Chat Completions format
+                      // (has 'choices' field), passthrough without conversion
+                      if (!hasCheckedFormat) {
+                        hasCheckedFormat = true;
+                        // Chat Completions format has 'choices' and 'object: chat.completion.chunk'
+                        if (data.choices || (data as any).object === "chat.completion.chunk") {
+                          isChatCompletionsFormat = true;
+                        }
+                      }
+
+                      if (isChatCompletionsFormat) {
+                        // Upstream is Chat Completions format, passthrough
+                        controller.enqueue(encoder.encode(`data: ${dataStr}\n\n`));
+                        if (dataStr === "[DONE]" || (data as any).choices?.[0]?.finish_reason) {
+                          // Don't add [DONE] here, it will be handled at stream end
+                        }
                         continue;
                       }
 
@@ -867,6 +1046,34 @@ export class OpenAIResponsesTransformer implements Transformer {
     return url;
   }
 
+  /**
+   * Build Chat Completions URL from provider base URL.
+   * Used when upstream provider only supports Chat Completions API.
+   */
+  private buildChatCompletionsUrl(baseUrl: string): URL {
+    const url = new URL(baseUrl);
+    const normalizedPath = url.pathname.replace(/\/+$/, "");
+
+    if (normalizedPath.endsWith("/chat/completions")) {
+      return url;
+    }
+
+    if (!normalizedPath || normalizedPath === "/") {
+      url.pathname = "/v1/chat/completions";
+      return url;
+    }
+
+    if (normalizedPath.endsWith("/v1")) {
+      url.pathname = `${normalizedPath}/chat/completions`;
+      return url;
+    }
+
+    // Remove /responses if present, then add /chat/completions
+    const withoutResponses = normalizedPath.replace(/\/responses$/, "");
+    url.pathname = `${withoutResponses}/chat/completions`;
+    return url;
+  }
+
   private hasMessageContent(content: UnifiedChatRequest["messages"][number]["content"]) {
     if (typeof content === "string") {
       return content.length > 0;
@@ -1031,5 +1238,320 @@ export class OpenAIResponsesTransformer implements Transformer {
     }
 
     return null;
+  }
+
+  /**
+   * Convert Chat Completions response back to Responses API format.
+   * This is used when the original request came from Codex CLI (Responses API format)
+   * and the upstream returned a Chat Completions format response.
+   * The response needs to be converted back to Responses API format for the client.
+   */
+  async transformResponseIn(
+    response: Response,
+    context?: TransformerContext
+  ): Promise<Response> {
+    const contentType = response.headers.get("Content-Type") || "";
+
+    if (contentType.includes("text/event-stream")) {
+      if (!response.body) return response;
+      return this.convertChatStreamToResponsesStream(response);
+    }
+
+    if (contentType.includes("application/json")) {
+      try {
+        const chatData: any = await response.json();
+        // Check if this is already a Responses API format response
+        if (chatData.object === "response" && chatData.output) {
+          // Already in Responses API format, return as-is
+          return new Response(JSON.stringify(chatData), {
+            status: response.status,
+            statusText: response.statusText,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        // Convert Chat Completions to Responses API format
+        const responseData = this.convertChatToJsonResponses(chatData);
+        return new Response(JSON.stringify(responseData), {
+          status: response.status,
+          statusText: response.statusText,
+          headers: { "Content-Type": "application/json" },
+        });
+      } catch {
+        return response;
+      }
+    }
+
+    return response;
+  }
+
+  /**
+   * Convert non-streaming Chat Completions JSON to Responses API format.
+   */
+  private convertChatToJsonResponses(chatData: any): any {
+    const choice = chatData.choices?.[0];
+    if (!choice) {
+      return {
+        id: chatData.id || `resp_${Date.now()}`,
+        object: "response",
+        model: chatData.model || "",
+        status: "failed",
+        output: [],
+      };
+    }
+
+    const output: any[] = [];
+
+    // Add reasoning if present
+    if (choice.message?.thinking?.content) {
+      output.push({
+        type: "reasoning",
+        id: `rs_${Date.now()}`,
+        summary: [{ type: "summary_text", text: choice.message.thinking.content }],
+      });
+    }
+
+    // Add message content
+    const content: any[] = [];
+    if (choice.message?.content) {
+      content.push({
+        type: "output_text",
+        text: choice.message.content,
+      });
+    }
+
+    if (content.length > 0) {
+      output.push({
+        type: "message",
+        id: `msg_${Date.now()}`,
+        role: "assistant",
+        content,
+      });
+    }
+
+    // Add function calls if present
+    if (choice.message?.tool_calls) {
+      for (const toolCall of choice.message.tool_calls) {
+        output.push({
+          type: "function_call",
+          id: toolCall.id || `fc_${Date.now()}`,
+          call_id: toolCall.id || `call_${Date.now()}`,
+          name: toolCall.function?.name || "",
+          arguments: toolCall.function?.arguments || "{}",
+        });
+      }
+    }
+
+    const status = choice.finish_reason === "tool_calls" ? "requires_action" :
+                   choice.finish_reason === "stop" ? "completed" :
+                   choice.finish_reason === "length" ? "incomplete" : "completed";
+
+    return {
+      id: chatData.id || `resp_${Date.now()}`,
+      object: "response",
+      model: chatData.model || "",
+      status,
+      output,
+      usage: chatData.usage ? {
+        input_tokens: chatData.usage.prompt_tokens || 0,
+        output_tokens: chatData.usage.completion_tokens || 0,
+        total_tokens: chatData.usage.total_tokens || 0,
+      } : undefined,
+    };
+  }
+
+  /**
+   * Convert streaming Chat Completions SSE to Responses API SSE format.
+   */
+  private async convertChatStreamToResponsesStream(response: Response): Promise<Response> {
+    const decoder = new TextDecoder("utf-8", { fatal: false });
+    const encoder = new TextEncoder();
+    let buffer = "";
+    let responseId = `resp_${Date.now()}`;
+    let model = "";
+    let isStreamEnded = false;
+
+    const transformer = this;
+    const stream = new ReadableStream({
+      async start(controller) {
+        const reader = response.body!.getReader();
+        let hasEmittedMessageItem = false;
+
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) {
+              if (!isStreamEnded) {
+                const completedEvent = {
+                  type: "response.completed",
+                  response: {
+                    id: responseId,
+                    object: "response",
+                    model,
+                    status: "completed",
+                    output: [],
+                  },
+                };
+                controller.enqueue(encoder.encode(`event: response.completed\ndata: ${JSON.stringify(completedEvent)}\n\n`));
+              }
+              break;
+            }
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split(/\r?\n/);
+            buffer = lines.pop() || "";
+
+            for (const line of lines) {
+              if (!line.trim()) continue;
+              if (line.startsWith("event:")) continue;
+              if (!line.startsWith("data:")) continue;
+
+              const dataStr = line.slice(5).trim();
+              if (dataStr === "[DONE]") {
+                isStreamEnded = true;
+                const completedEvent = {
+                  type: "response.completed",
+                  response: {
+                    id: responseId,
+                    object: "response",
+                    model,
+                    status: "completed",
+                    output: [],
+                  },
+                };
+                controller.enqueue(encoder.encode(`event: response.completed\ndata: ${JSON.stringify(completedEvent)}\n\n`));
+                continue;
+              }
+
+              try {
+                const chunk = JSON.parse(dataStr);
+                model = chunk.model || model;
+                responseId = chunk.id || responseId;
+
+                const choice = chunk.choices?.[0];
+                if (!choice) continue;
+
+                // Emit message item at first content
+                if (!hasEmittedMessageItem && (choice.delta?.content || choice.delta?.role === "assistant")) {
+                  hasEmittedMessageItem = true;
+                  const messageItem = {
+                    type: "response.output_item.added",
+                    output_index: 0,
+                    item: {
+                      type: "message",
+                      id: `msg_${Date.now()}`,
+                      role: "assistant",
+                      content: [],
+                    },
+                  };
+                  controller.enqueue(encoder.encode(`event: response.output_item.added\ndata: ${JSON.stringify(messageItem)}\n\n`));
+                }
+
+                // Text content delta
+                if (choice.delta?.content) {
+                  const textDelta = {
+                    type: "response.output_text.delta",
+                    output_index: 0,
+                    content_index: 0,
+                    delta: choice.delta.content,
+                  };
+                  controller.enqueue(encoder.encode(`event: response.output_text.delta\ndata: ${JSON.stringify(textDelta)}\n\n`));
+                }
+
+                // Thinking/reasoning delta
+                if (choice.delta?.thinking?.content) {
+                  const reasoningDelta = {
+                    type: "response.reasoning_summary_text.delta",
+                    output_index: 0,
+                    delta: choice.delta.thinking.content,
+                  };
+                  controller.enqueue(encoder.encode(`event: response.reasoning_summary_text.delta\ndata: ${JSON.stringify(reasoningDelta)}\n\n`));
+                }
+
+                // Tool calls
+                if (choice.delta?.tool_calls) {
+                  for (const toolCall of choice.delta.tool_calls) {
+                    if (toolCall.function?.name) {
+                      const toolItem = {
+                        type: "response.output_item.added",
+                        output_index: 1,
+                        item: {
+                          type: "function_call",
+                          id: toolCall.id || `fc_${Date.now()}`,
+                          call_id: toolCall.id || `call_${Date.now()}`,
+                          name: toolCall.function.name,
+                          arguments: "",
+                        },
+                      };
+                      controller.enqueue(encoder.encode(`event: response.output_item.added\ndata: ${JSON.stringify(toolItem)}\n\n`));
+                    }
+
+                    if (toolCall.function?.arguments) {
+                      const argsDelta = {
+                        type: "response.function_call_arguments.delta",
+                        output_index: 1,
+                        item_id: toolCall.id,
+                        delta: toolCall.function.arguments,
+                      };
+                      controller.enqueue(encoder.encode(`event: response.function_call_arguments.delta\ndata: ${JSON.stringify(argsDelta)}\n\n`));
+                    }
+                  }
+                }
+
+                // Finish reason
+                if (choice.finish_reason) {
+                  if (hasEmittedMessageItem) {
+                    const textDone = {
+                      type: "response.output_text.done",
+                      output_index: 0,
+                      content_index: 0,
+                      text: "",
+                    };
+                    controller.enqueue(encoder.encode(`event: response.output_text.done\ndata: ${JSON.stringify(textDone)}\n\n`));
+
+                    const contentPartDone = {
+                      type: "response.content_part.done",
+                      output_index: 0,
+                      content_index: 0,
+                      part: { type: "output_text", text: "" },
+                    };
+                    controller.enqueue(encoder.encode(`event: response.content_part.done\ndata: ${JSON.stringify(contentPartDone)}\n\n`));
+
+                    const outputItemDone = {
+                      type: "response.output_item.done",
+                      output_index: 0,
+                      item: {
+                        type: "message",
+                        id: `msg_${Date.now()}`,
+                        role: "assistant",
+                        content: [{ type: "output_text", text: "" }],
+                      },
+                    };
+                    controller.enqueue(encoder.encode(`event: response.output_item.done\ndata: ${JSON.stringify(outputItemDone)}\n\n`));
+                  }
+                }
+              } catch {
+                // Skip malformed JSON
+              }
+            }
+          }
+        } catch (error) {
+          transformer.logger?.debug?.("Stream conversion error:", error);
+          controller.error(error);
+        } finally {
+          try { reader.releaseLock(); } catch {}
+          controller.close();
+        }
+      },
+    });
+
+    return new Response(stream, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      },
+    });
   }
 }

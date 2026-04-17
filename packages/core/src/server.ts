@@ -260,7 +260,7 @@ class Server {
         "preHandler",
         async (req: FastifyRequest, reply: FastifyReply) => {
           const url = new URL(`http://127.0.0.1${req.url}`);
-          if ((url.pathname.endsWith("/v1/messages") || url.pathname.endsWith("/v1/chat/completions")) && req.body) {
+          if ((url.pathname.endsWith("/v1/messages") || url.pathname.endsWith("/v1/chat/completions") || url.pathname.endsWith("/v1/responses")) && req.body) {
             try {
               const body = req.body as any;
               if (!body || !body.model) {
@@ -268,10 +268,27 @@ class Server {
                   .code(400)
                   .send({ error: "Missing model in request body" });
               }
-              const [provider, ...model] = body.model.split(",");
-              body.model = model.join(",");
-              req.provider = provider;
-              req.model = model;
+              // If model contains a comma, it's in "provider,model" format
+              if (body.model.includes(",")) {
+                const [provider, ...model] = body.model.split(",");
+                body.model = model.join(",");
+                req.provider = provider;
+                req.model = model;
+              } else {
+                // Model without provider prefix — resolve via providerService
+                // (e.g., "glm-5.1" → provider "yuanjing", model "glm-5.1")
+                const route = this.providerService?.resolveModelRoute?.(body.model);
+                if (route) {
+                  req.provider = route.provider.name;
+                  // Don't change body.model — the model name stays as-is
+                  // (the transformer will handle stripping the provider prefix)
+                  req.model = [route.targetModel];
+                } else {
+                  // Fallback: use the model name as provider (legacy behavior)
+                  req.provider = body.model;
+                  req.model = [];
+                }
+              }
               return;
             } catch (err) {
               req.log.error({error: err}, "Error in modelProviderMiddleware:");
