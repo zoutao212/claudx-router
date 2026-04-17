@@ -7,6 +7,20 @@ echo.
 REM Set UTF-8 encoding for console
 chcp 65001 >nul
 
+REM Kill residual processes on port 8082
+set KILL_PORT=8082
+echo Checking for residual processes on port %KILL_PORT%...
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr "LISTENING" ^| findstr ":%KILL_PORT% "') do (
+    echo   Found process %%a on port %KILL_PORT%, killing...
+    taskkill /F /PID %%a >nul 2>&1
+    if errorlevel 1 (
+        echo   [WARN] Failed to kill process %%a
+    ) else (
+        echo   [OK] Killed process %%a
+    )
+)
+echo.
+
 echo Checking if packages need building...
 if not exist "packages\core\dist" (
     echo Building core package...

@@ -245,6 +245,24 @@ export class OpenAIResponsesTransformer implements Transformer {
       };
     }
 
+    // For requests from other transformers (e.g., Claude Code via Anthropic transformer),
+    // the request is already in Chat Completions format.
+    // Most upstream providers support Chat Completions, so passthrough directly
+    // instead of converting to Responses API format (which many providers don't support).
+    // Point URL to /chat/completions and keep the request as-is.
+    if ((request as any).messages && !(request as any).input) {
+      return {
+        body: request,
+        config: {
+          url: this.buildChatCompletionsUrl(provider.baseUrl),
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Accept': 'text/event-stream, application/json, */*',
+          },
+        },
+      };
+    }
+
     // Original logic: convert Chat Completions → Responses API format
     // for upstream providers that support Responses API
     delete request.temperature;

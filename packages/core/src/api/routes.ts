@@ -86,6 +86,20 @@ async function handleTransformerEndpoint(
       }
     );
 
+    // DEBUG: Log the request being sent to provider
+    req.log.info({
+      reqId: (req as any).id,
+      phase: "debug_before_send",
+      providerName,
+      upstreamUrl: config.url ? config.url.toString() : provider.baseUrl,
+      requestBodyModel: requestBody.model,
+      requestBodyKeys: Object.keys(requestBody),
+      hasMessages: !!requestBody.messages,
+      hasInput: !!requestBody.input,
+      messagesCount: requestBody.messages?.length,
+      bypass,
+    }, "DEBUG: About to send request to provider");
+
     // Send request to LLM provider
     const response = await sendRequestToProvider(
       requestBody,
