@@ -311,10 +311,10 @@ class Server {
                 req.log.info(`Model migration: "${originalModel}" → "${body.model}"`);
               }
 
-              // If model contains a comma, it's in "provider,model" format
-              if (body.model.includes(",")) {
-                const [provider, ...model] = body.model.split(",");
-                body.model = model.join(",");
+              // If model contains a slash, it's in "provider/model" format
+              if (body.model.includes("/")) {
+                const [provider, ...model] = body.model.split("/");
+                body.model = model.join("/");
                 req.provider = provider;
                 req.model = model;
               } else {
@@ -440,9 +440,9 @@ class Server {
               body.model = modelMigrations[body.model];
               req.log.info(`Model migration: "${originalModel}" → "${body.model}"`);
             }
-            if (body.model.includes(",")) {
-              const [provider, ...model] = body.model.split(",");
-              body.model = model.join(",");
+            if (body.model.includes("/")) {
+              const [provider, ...model] = body.model.split("/");
+              body.model = model.join("/");
               req.provider = provider;
               req.model = model;
             } else {

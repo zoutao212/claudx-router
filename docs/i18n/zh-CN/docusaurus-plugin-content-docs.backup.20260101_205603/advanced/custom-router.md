@@ -134,7 +134,7 @@ tail -f ~/.claude-code-router/claude-code-router.log
 
 ## 子代理路由
 
-对于子代理内的路由，您必须在子代理提示词的**开头**包含 `<CCR-SUBAGENT-MODEL>provider,model</CCR-SUBAGENT-MODEL>` 来指定特定的提供商和模型。
+对于子代理内的路由，您必须在子代理提示词的**开头**包含 `<CCR-SUBAGENT-MODEL>provider/model</CCR-SUBAGENT-MODEL>` 来指定特定的提供商和模型。
 
 **示例：**
 

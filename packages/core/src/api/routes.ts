@@ -188,8 +188,8 @@ async function handleFallback(
 
       // Update request with fallback model
       const newBody = { ...(req.body as any) };
-      const [fallbackProvider, ...fallbackModelName] = fallbackModel.split(',');
-      newBody.model = fallbackModelName.join(',');
+      const [fallbackProvider, ...fallbackModelName] = fallbackModel.split('/');
+      newBody.model = fallbackModelName.join('/');
 
       // Create new request object with updated provider and body
       const newReq = {
@@ -440,10 +440,10 @@ async function sendRequestToProvider(
   if (!response.ok) {
     const errorText = await response.text();
     fastify.log.error(
-      `[provider_response_error] Error from provider(${provider.name},${requestBody.model}: ${response.status}): ${errorText}`,
+      `[provider_response_error] Error from provider(${provider.name}/${requestBody.model}: ${response.status}): ${errorText}`,
     );
     throw createApiError(
-      `Error from provider(${provider.name},${requestBody.model}: ${response.status}): ${errorText}`,
+      `Error from provider(${provider.name}/${requestBody.model}: ${response.status}): ${errorText}`,
       response.status,
       "provider_response_error"
     );

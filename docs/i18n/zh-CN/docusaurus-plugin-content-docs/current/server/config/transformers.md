@@ -619,7 +619,7 @@ module.exports = class MyTransformer {
 }
 ```
 
-注意：模型格式为 `provider,model`（例如 `deepseek,deepseek-chat`）。
+注意：模型格式为 `provider/model`（例如 `deepseek/deepseek-chat`）。
 
 ### 全局转换器（所有提供商）
 

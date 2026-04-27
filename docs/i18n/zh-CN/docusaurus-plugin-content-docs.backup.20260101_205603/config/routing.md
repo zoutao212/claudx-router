@@ -138,7 +138,7 @@ module.exports = async function(req, config) {
 使用特殊标签为子代理指定模型：
 
 ```
-<CCR-SUBAGENT-MODEL>provider,model</CCR-SUBAGENT-MODEL>
+<CCR-SUBAGENT-MODEL>provider/model</CCR-SUBAGENT-MODEL>
 请帮我分析这段代码...
 ```
 

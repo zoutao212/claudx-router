@@ -131,9 +131,9 @@ const getUseModel = async (
   const providers = configService.get<any[]>("providers") || [];
   const Router = projectSpecificRouter || configService.get("Router");
 
-  if (req.body.model.includes(",")) {
-    const [provider, ...modelParts] = req.body.model.split(",");
-    const model = modelParts.join(",");
+  if (req.body.model.includes("/")) {
+    const [provider, ...modelParts] = req.body.model.split("/");
+    const model = modelParts.join("/");
     const finalProvider = providers.find(
       (p: any) => p.name.toLowerCase() === provider.toLowerCase()
     );
@@ -156,7 +156,7 @@ const getUseModel = async (
       (m: string) => m.toLowerCase() === model.toLowerCase()
     );
     if (finalProvider && matchedModel) {
-      return { model: `${finalProvider.name},${matchedModel}`, scenarioType: 'default' };
+      return { model: `${finalProvider.name}/${matchedModel}`, scenarioType: 'default' };
     }
     return { model: req.body.model, scenarioType: 'default' };
   }
@@ -254,7 +254,8 @@ export const router = async (req: any, _res: any, context: RouterContext) => {
 
   try {
     // Try to get tokenizer config for the current model
-    const [providerName, modelName] = req.body.model.split(",");
+    const [providerName, ...modelParts] = req.body.model.split("/");
+    const modelName = modelParts.join("/");
     const tokenizerConfig = context.tokenizerService?.getTokenizerConfigForModel(
       providerName,
       modelName

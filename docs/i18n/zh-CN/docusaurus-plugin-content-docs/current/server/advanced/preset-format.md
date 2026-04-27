@@ -158,7 +158,7 @@ Provider 配置数组，定义 LLM 服务提供商。
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `default` | string | 默认路由（格式：`provider,model`） |
+| `default` | string | 默认路由（格式：`provider/model`） |
 | `background` | string | 后台任务路由 |
 | `think` | string | 思考模式路由 |
 | `longContext` | string | 长上下文路由 |

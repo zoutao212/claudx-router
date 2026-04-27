@@ -618,7 +618,7 @@ Apply to specific models only:
 }
 ```
 
-Note: The model format is `provider,model` (e.g., `deepseek,deepseek-chat`).
+Note: The model format is `provider/model` (e.g., `deepseek/deepseek-chat`).
 
 ### Global Transformers (All Providers)
 

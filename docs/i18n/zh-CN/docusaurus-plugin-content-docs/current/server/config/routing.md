@@ -14,7 +14,7 @@ sidebar_position: 3
 ```json
 {
   "Router": {
-    "default": "deepseek,deepseek-chat"
+    "default": "deepseek/deepseek-chat"
   }
 }
 ```
@@ -28,7 +28,7 @@ sidebar_position: 3
 ```json
 {
   "Router": {
-    "background": "groq,llama-3.3-70b-versatile"
+    "background": "groq/llama-3.3-70b-versatile"
   }
 }
 ```
@@ -40,7 +40,7 @@ sidebar_position: 3
 ```json
 {
   "Router": {
-    "think": "deepseek,deepseek-reasoner"
+    "think": "deepseek/deepseek-reasoner"
   }
 }
 ```
@@ -53,7 +53,7 @@ sidebar_position: 3
 {
   "Router": {
     "longContextThreshold": 100000,
-    "longContext": "gemini,gemini-2.5-pro"
+    "longContext": "gemini/gemini-2.5-pro"
   }
 }
 ```
@@ -65,7 +65,7 @@ sidebar_position: 3
 ```json
 {
   "Router": {
-    "webSearch": "gemini,gemini-2.5-flash"
+    "webSearch": "gemini/gemini-2.5-flash"
   }
 }
 ```
@@ -77,7 +77,7 @@ sidebar_position: 3
 ```json
 {
   "Router": {
-    "image": "gemini,gemini-2.5-pro"
+    "image": "gemini/gemini-2.5-pro"
   }
 }
 ```
@@ -91,29 +91,29 @@ sidebar_position: 3
 ```json
 {
   "Router": {
-    "default": "deepseek,deepseek-chat",
-    "background": "ollama,qwen2.5-coder:latest",
-    "think": "deepseek,deepseek-reasoner",
-    "longContext": "openrouter,google/gemini-2.5-pro-preview",
+    "default": "deepseek/deepseek-chat",
+    "background": "ollama/qwen2.5-coder:latest",
+    "think": "deepseek/deepseek-reasoner",
+    "longContext": "openrouter/google/gemini-2.5-pro-preview",
     "longContextThreshold": 60000,
-    "webSearch": "gemini,gemini-2.5-flash"
+    "webSearch": "gemini/gemini-2.5-flash"
   },
   "fallback": {
     "default": [
-      "aihubmix,Z/glm-4.5",
-      "openrouter,anthropic/claude-sonnet-4"
+      "aihubmix/Z/glm-4.5",
+      "openrouter/anthropic/claude-sonnet-4"
     ],
     "background": [
-      "ollama,qwen2.5-coder:latest"
+      "ollama/qwen2.5-coder:latest"
     ],
     "think": [
-      "openrouter,anthropic/claude-3.7-sonnet:thinking"
+      "openrouter/anthropic/claude-3.7-sonnet:thinking"
     ],
     "longContext": [
-      "modelscope,Qwen/Qwen3-Coder-480B-A35B-Instruct"
+      "modelscope/Qwen/Qwen3-Coder-480B-A35B-Instruct"
     ],
     "webSearch": [
-      "openrouter,anthropic/claude-sonnet-4"
+      "openrouter/anthropic/claude-sonnet-4"
     ]
   }
 }
@@ -129,7 +129,7 @@ sidebar_position: 3
 
 ### 配置说明
 
-- **格式**：每个备用模型格式为 `provider,model`
+- **格式**：每个备用模型格式为 `provider/model`
 - **验证**：备用模型必须在 `Providers` 配置中存在
 - **灵活性**：可以为不同场景配置不同的备用列表
 - **可选性**：如果某个场景不需要备用，可以不配置或使用空数组
@@ -159,12 +159,12 @@ sidebar_position: 3
 ```json
 {
   "Router": {
-    "background": "volcengine,deepseek-v3-250324"
+    "background": "volcengine/deepseek-v3-250324"
   },
   "fallback": {
     "background": [
-      "modelscope,Qwen/Qwen3-Coder-480B-A35B-Instruct",
-      "dashscope,qwen3-coder-plus"
+      "modelscope/Qwen/Qwen3-Coder-480B-A35B-Instruct",
+      "dashscope/qwen3-coder-plus"
     ]
   }
 }
@@ -178,10 +178,10 @@ sidebar_position: 3
 
 ```
 [warn] Request failed for default, trying 2 fallback models
-[info] Trying fallback model: aihubmix,Z/glm-4.5
-[warn] Fallback model aihubmix,Z/glm-4.5 failed: API rate limit exceeded
-[info] Trying fallback model: openrouter,anthropic/claude-sonnet-4
-[info] Fallback model openrouter,anthropic/claude-sonnet-4 succeeded
+[info] Trying fallback model: aihubmix/Z/glm-4.5
+[warn] Fallback model aihubmix/Z/glm-4.5 failed: API rate limit exceeded
+[info] Trying fallback model: openrouter/anthropic/claude-sonnet-4
+[info] Fallback model openrouter/anthropic/claude-sonnet-4 succeeded
 ```
 
 ### 注意事项
@@ -246,7 +246,7 @@ module.exports = async function(req, config) {
 使用特殊标签为子代理指定模型：
 
 ```
-<CCR-SUBAGENT-MODEL>provider,model</CCR-SUBAGENT-MODEL>
+<CCR-SUBAGENT-MODEL>provider/model</CCR-SUBAGENT-MODEL>
 请帮我分析这段代码...
 ```
 

@@ -170,9 +170,10 @@ npm install -g @musistudio/claude-code-router
     }
   ],
   "Router": {
-    "default": "deepseek,deepseek-chat",
+    "default": "deepseek/deepseek-chat",
+
     "background": "ollama,qwen2.5-coder:latest",
-    "think": "deepseek,deepseek-reasoner",
+    "think": "deepseek/deepseek-reasoner",
     "longContext": "openrouter,google/gemini-2.5-pro-preview",
     "longContextThreshold": 60000,
     "webSearch": "gemini,gemini-2.5-flash"
@@ -449,7 +450,7 @@ Transformers 允许您修改请求和响应负载，以确保与不同提供商 
  *
  * @param {object} req - 来自 Claude Code 的请求对象，包含请求体。
  * @param {object} config - 应用程序的配置对象。
- * @returns {Promise<string|null>} - 一个解析为 "provider,model_name" 字符串的 Promise，如果返回 null，则使用默认路由。
+ * @returns {Promise<string|null>} - 一个解析为 "provider/model_name" 字符串的 Promise，如果返回 null，则使用默认路由。
  */
 module.exports = async function router(req, config) {
   const userMessage = req.body.messages.find(m => m.role === 'user')?.content;
@@ -466,7 +467,7 @@ module.exports = async function router(req, config) {
 
 ##### 子代理路由
 
-对于子代理内的路由，您必须在子代理提示词的**开头**包含 `<CCR-SUBAGENT-MODEL>provider,model</CCR-SUBAGENT-MODEL>` 来指定特定的提供商和模型。这样可以将特定的子代理任务定向到指定的模型。
+对于子代理内的路由，您必须在子代理提示词的**开头**包含 `<CCR-SUBAGENT-MODEL>provider/model</CCR-SUBAGENT-MODEL>` 来指定特定的提供商和模型。这样可以将特定的子代理任务定向到指定的模型。
 
 **示例：**
 

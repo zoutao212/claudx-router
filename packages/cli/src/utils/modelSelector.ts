@@ -95,7 +95,7 @@ function getAllModels(config: Config) {
     for (const model of provider.models) {
       models.push({
         name: `${BOLDCYAN}${provider.name}${RESET} → ${CYAN} ${model}`,
-        value: `${provider.name},${model}`,
+        value: `${provider.name}/${model}`,
         description: `\n${BOLDCYAN}Provider:${RESET} ${provider.name}`,
         provider: provider.name,
         model: model
@@ -114,7 +114,8 @@ function displayCurrentConfig(config: Config): void {
     if (!routerValue || typeof routerValue === 'number') {
       return `${DIM}Not configured${RESET}`;
     }
-    const [provider, model] = routerValue.split(',');
+    const [provider, ...modelParts] = routerValue.split('/');
+    const model = modelParts.join('/');
     return `${YELLOW}${provider}${RESET} | ${model}\n  ${DIM}- ${routerValue}${RESET}`;
   };
   
@@ -442,9 +443,9 @@ export async function runModelSelector(): Promise<void> {
       
       if (result) {
         config = loadConfig();
-        config.Router[result.modelType] = `${result.providerName},${result.modelName}`;
+        config.Router[result.modelType] = `${result.providerName}/${result.modelName}`;
         saveConfig(config);
-        console.log(`${GREEN}✓ ${result.modelType} set to ${result.providerName},${result.modelName}${RESET}`);
+        console.log(`${GREEN}✓ ${result.modelType} set to ${result.providerName}/${result.modelName}${RESET}`);
       }
     } else {
       const selectedModel = await selectModel(config, action) as string;

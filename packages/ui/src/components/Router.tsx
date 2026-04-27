@@ -57,8 +57,8 @@ export function Router() {
     return models.map((model) => {
       const modelName = typeof model === 'string' ? model : (model?.name || "Unknown Model");
       return {
-        value: `${providerName},${modelName}`,
-        label: `${providerName}, ${modelName}`,
+        value: `${providerName}/${modelName}`,
+        label: `${providerName} / ${modelName}`,
       };
     });
   });

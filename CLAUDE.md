@@ -147,7 +147,7 @@ ccr preset delete <name>      # Delete a preset
 
 Use special tags in subagent prompts to specify models:
 ```
-<CCR-SUBAGENT-MODEL>provider,model</CCR-SUBAGENT-MODEL>
+<CCR-SUBAGENT-MODEL>provider/model</CCR-SUBAGENT-MODEL>
 Please help me analyze this code...
 ```
 

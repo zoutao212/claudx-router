@@ -53,16 +53,17 @@ export const createServer = async (config: any): Promise<any> => {
     const {messages, tools, system, model} = req.body;
     const tokenizerService = (app as any)._server!.tokenizerService as TokenizerService;
 
-    // If model is specified in "providerName,modelName" format, use the configured tokenizer
-    if (model && model.includes(",") && tokenizerService) {
+    // If model is specified in "providerName/modelName" format, use the configured tokenizer
+    if (model && model.includes("/") && tokenizerService) {
       try {
-        const [provider, modelName] = model.split(",");
+        const [provider, ...modelParts] = model.split("/");
+        const modelName = modelParts.join("/");
         req.log?.info(`Looking up tokenizer for provider: ${provider}, model: ${modelName}`);
 
         const tokenizerConfig = tokenizerService.getTokenizerConfigForModel(provider, modelName);
 
         if (!tokenizerConfig) {
-          req.log?.warn(`No tokenizer config found for ${provider},${modelName}, using default tiktoken`);
+          req.log?.warn(`No tokenizer config found for ${provider}/${modelName}, using default tiktoken`);
         } else {
           req.log?.info(`Using tokenizer config: ${JSON.stringify(tokenizerConfig)}`);
         }
@@ -84,8 +85,8 @@ export const createServer = async (config: any): Promise<any> => {
     } else {
       if (!model) {
         req.log?.info(`No model specified, using default tiktoken`);
-      } else if (!model.includes(",")) {
-        req.log?.info(`Model "${model}" does not contain comma, using default tiktoken`);
+      } else if (!model.includes("/")) {
+        req.log?.info(`Model "${model}" does not contain slash, using default tiktoken`);
       } else if (!tokenizerService) {
         req.log?.warn(`TokenizerService not available, using default tiktoken`);
       }

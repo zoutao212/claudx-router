@@ -101,7 +101,7 @@ curl -X POST http://localhost:3456/api/config \
 ```json
 {
   "Router": {
-    "default": "provider,model",
+    "default": "provider/model",
     "longContextThreshold": 100000,
     "routes": {
       "background": "lightweight-model",

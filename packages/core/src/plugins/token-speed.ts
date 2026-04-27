@@ -122,7 +122,7 @@ export const tokenSpeedPlugin: CCRPlugin = {
       }
 
       // Extract provider and model from request
-      // Format: "provider,model" or just "model"
+      // Format: "provider/model" or just "model"
       if (!request.provider || !request.model) {
         return null;
       }

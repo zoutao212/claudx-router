@@ -693,7 +693,8 @@ export async function parseStatusLineData(input: StatusLineInput, presetName?: s
 
                 // Get model name from Router field's default content
                 if (config.Router && config.Router.default) {
-                    const [, defaultModel] = config.Router.default.split(",");
+                    const parts = config.Router.default.split("/");
+                    const defaultModel = parts.slice(1).join("/");
                     if (defaultModel) {
                         model = defaultModel.trim();
                     }

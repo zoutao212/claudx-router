@@ -128,7 +128,7 @@ When a request fails, you can configure a list of backup models. The system will
 
 ### Configuration Details
 
-- **Format**: Each backup model format is `provider,model`
+- **Format**: Each backup model format is `provider/model`
 - **Validation**: Backup models must exist in the `Providers` configuration
 - **Flexibility**: Different scenarios can have different fallback lists
 - **Optional**: If a scenario doesn't need fallback, omit it or use an empty array
@@ -247,7 +247,7 @@ The router uses `tiktoken` (cl100k_base) to estimate request token count. This i
 Specify models for subagents using special tags:
 
 ```
-<CCR-SUBAGENT-MODEL>provider,model</CCR-SUBAGENT-MODEL>
+<CCR-SUBAGENT-MODEL>provider/model</CCR-SUBAGENT-MODEL>
 Please help me analyze this code...
 ```
 

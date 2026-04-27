@@ -194,7 +194,7 @@ export class ProviderService {
     request.models.forEach((entry) => {
       const modelName = normalizeModelName(entry);
       const aliases = extractAliases(entry);
-      const fullModel = `${provider.name},${modelName}`;
+      const fullModel = `${provider.name}/${modelName}`;
       const route: ModelRoute = {
         provider: provider.name,
         model: modelName,
@@ -202,7 +202,7 @@ export class ProviderService {
         aliases: aliases.length > 0 ? aliases : undefined,
       };
 
-      // Register the full "provider,model" route
+      // Register the full "provider/model" route
       this.modelRoutes.set(fullModel, route);
 
       // Register the bare model name as a route (if not already taken)
@@ -215,8 +215,8 @@ export class ProviderService {
         if (!this.modelRoutes.has(alias)) {
           this.modelRoutes.set(alias, route);
         }
-        // Also register "provider,alias" format
-        const fullAlias = `${provider.name},${alias}`;
+        // Also register "provider/alias" format
+        const fullAlias = `${provider.name}/${alias}`;
         if (!this.modelRoutes.has(fullAlias)) {
           this.modelRoutes.set(fullAlias, route);
         }
@@ -255,14 +255,14 @@ export class ProviderService {
       // Clean up old routes
       provider.models.forEach((modelEntry) => {
         const modelName = normalizeModelName(modelEntry);
-        const fullModel = `${provider.name},${modelName}`;
+        const fullModel = `${provider.name}/${modelName}`;
         this.modelRoutes.delete(fullModel);
         this.modelRoutes.delete(modelName);
         // Also clean up any aliases from old routes
         const aliases = extractAliases(modelEntry);
         for (const alias of aliases) {
           this.modelRoutes.delete(alias);
-          this.modelRoutes.delete(`${provider.name},${alias}`);
+          this.modelRoutes.delete(`${provider.name}/${alias}`);
         }
       });
 
@@ -270,7 +270,7 @@ export class ProviderService {
       updates.models.forEach((modelEntry) => {
         const modelName = normalizeModelName(modelEntry);
         const aliases = extractAliases(modelEntry);
-        const fullModel = `${provider.name},${modelName}`;
+        const fullModel = `${provider.name}/${modelName}`;
         const route: ModelRoute = {
           provider: provider.name,
           model: modelName,
@@ -285,7 +285,7 @@ export class ProviderService {
           if (!this.modelRoutes.has(alias)) {
             this.modelRoutes.set(alias, route);
           }
-          const fullAlias = `${provider.name},${alias}`;
+          const fullAlias = `${provider.name}/${alias}`;
           if (!this.modelRoutes.has(fullAlias)) {
             this.modelRoutes.set(fullAlias, route);
           }
@@ -304,14 +304,14 @@ export class ProviderService {
 
     provider.models.forEach((modelEntry) => {
       const modelName = normalizeModelName(modelEntry);
-      const fullModel = `${provider.name},${modelName}`;
+      const fullModel = `${provider.name}/${modelName}`;
       this.modelRoutes.delete(fullModel);
       this.modelRoutes.delete(modelName);
       // Also clean up aliases
       const aliases = extractAliases(modelEntry);
       for (const alias of aliases) {
         this.modelRoutes.delete(alias);
-        this.modelRoutes.delete(`${provider.name},${alias}`);
+        this.modelRoutes.delete(`${provider.name}/${alias}`);
       }
     });
 
