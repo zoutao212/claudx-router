@@ -162,6 +162,35 @@ export class ProviderService {
       transformerConfig.use = [apiTransformerName, ...currentUse];
     }
 
+    // Auto-add DeepseekTransformer for DeepSeek-related providers.
+    // DeepSeek's API requires reasoning_content to be passed back on assistant messages
+    // when thinking mode is active. The DeepseekTransformer handles this conversion
+    // (thinking back to reasoning_content on requests, and reasoning_content to thinking
+    // on responses). Match by provider name or base URL containing "deepseek" or
+    // "opencode.ai" (which proxies DeepSeek models).
+    const deepseekTransformerName = "deepseek";
+    if (this.transformerService.hasTransformer(deepseekTransformerName)) {
+      const providerLower = providerConfig.name.toLowerCase();
+      const baseUrlLower = (providerConfig.api_base_url || "").toLowerCase();
+      if (
+        providerLower.includes("deepseek") ||
+        baseUrlLower.includes("deepseek") ||
+        baseUrlLower.includes("opencode.ai")
+      ) {
+        const use = Array.isArray(transformerConfig.use)
+          ? transformerConfig.use
+          : [];
+        const alreadyHasDeepseek = use.some((item: any) =>
+          Array.isArray(item)
+            ? item[0] === deepseekTransformerName
+            : item === deepseekTransformerName
+        );
+        if (!alreadyHasDeepseek) {
+          transformerConfig.use = [...use, deepseekTransformerName];
+        }
+      }
+    }
+
     return {
       ...providerConfig,
       transformer: transformerConfig as ConfigProvider["transformer"],

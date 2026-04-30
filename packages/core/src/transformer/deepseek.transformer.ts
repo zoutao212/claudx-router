@@ -8,6 +8,25 @@ export class DeepseekTransformer implements Transformer {
     if (request.max_tokens && request.max_tokens > 8192) {
       request.max_tokens = 8192; // DeepSeek has a max token limit of 8192
     }
+    // DeepSeek requires reasoning_content to be passed back on ALL assistant messages
+    // when thinking mode is active. The client (CodeBuddy/Cursor) typically strips both
+    // reasoning_content and thinking from the assistant message object between turns, so
+    // we must ensure reasoning_content is always present before forwarding to DeepSeek.
+    if (request.messages) {
+      for (const message of request.messages) {
+        if (message.role !== "assistant") continue;
+        // Convert router-internal thinking → DeepSeek reasoning_content (client preserved it)
+        if ((message as any).thinking?.content) {
+          (message as any).reasoning_content = (message as any).thinking.content;
+          delete (message as any).thinking;
+        }
+        // DeepSeek rejects requests when assistant messages lack reasoning_content entirely.
+        // If the client stripped it, add an empty string fallback to satisfy the API.
+        if (!(message as any).reasoning_content) {
+          (message as any).reasoning_content = "";
+        }
+      }
+    }
     return request;
   }
 
@@ -86,7 +105,6 @@ export class DeepseekTransformer implements Transformer {
                       },
                     ],
                   };
-                  delete thinkingChunk.choices[0].delta.reasoning_content;
                   const thinkingLine = `data: ${JSON.stringify(
                     thinkingChunk
                   )}\n\n`;
@@ -120,16 +138,11 @@ export class DeepseekTransformer implements Transformer {
                       },
                     ],
                   };
-                  delete thinkingChunk.choices[0].delta.reasoning_content;
                   // Send the thinking chunk
                   const thinkingLine = `data: ${JSON.stringify(
                     thinkingChunk
                   )}\n\n`;
                   controller.enqueue(encoder.encode(thinkingLine));
-                }
-
-                if (data.choices[0]?.delta?.reasoning_content) {
-                  delete data.choices[0].delta.reasoning_content;
                 }
 
                 // Send the modified chunk
