@@ -3,8 +3,9 @@ import {
   LLMProvider,
   MessageContent,
   UnifiedChatRequest,
+  UnifiedMessage,
 } from "@/types/llm";
-import { Transformer } from "@/types/transformer";
+import { Transformer, TransformerContext } from "@/types/transformer";
 
 interface ResponsesAPIAnnotation {
   url?: string;
@@ -77,6 +78,9 @@ interface ResponsesStreamEvent {
     }>;
   };
   reasoning_summary?: string;
+  choices?: Array<{
+    finish_reason?: string | null;
+  }>;
 }
 
 export class OpenAIResponsesTransformer implements Transformer {
@@ -241,6 +245,8 @@ export class OpenAIResponsesTransformer implements Transformer {
     request: UnifiedChatRequest,
     provider: LLMProvider
   ): Promise<UnifiedChatRequest | { body: UnifiedChatRequest; config: { url: URL; headers: Record<string, string> } }> {
+    const normalizedPath = new URL(provider.baseUrl).pathname.replace(/\/+$/, "");
+
     // If this request was converted from Responses API format (Codex CLI),
     // the upstream provider expects Chat Completions format.
     // Skip the Responses API conversion and point URL to /chat/completions.
@@ -263,7 +269,7 @@ export class OpenAIResponsesTransformer implements Transformer {
     // Most upstream providers support Chat Completions, so passthrough directly
     // instead of converting to Responses API format (which many providers don't support).
     // Point URL to /chat/completions and keep the request as-is.
-    if ((request as any).messages && !(request as any).input) {
+    if ((request as any).messages && !(request as any).input && !normalizedPath.endsWith("/responses")) {
       return {
         body: request,
         config: {
@@ -1084,10 +1090,6 @@ export class OpenAIResponsesTransformer implements Transformer {
   private buildChatCompletionsUrl(baseUrl: string): URL {
     const url = new URL(baseUrl);
     const normalizedPath = url.pathname.replace(/\/+$/, "");
-
-    if (normalizedPath.endsWith("/chat/completions")) {
-      return url;
-    }
 
     if (!normalizedPath || normalizedPath === "/") {
       url.pathname = "/v1/chat/completions";

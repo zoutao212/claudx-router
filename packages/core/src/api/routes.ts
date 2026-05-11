@@ -4,6 +4,7 @@ import {
   FastifyRequest,
   FastifyReply,
 } from "fastify";
+import { Readable } from "node:stream";
 import { RegisterProviderRequest, LLMProvider } from "@/types/llm";
 import { sendUnifiedRequest } from "@/utils/request";
 import { redactHeaders, traceLog, traceStream, traceInit } from "@/utils/trace-logger";
@@ -543,7 +544,7 @@ async function processResponseTransformers(
  * For streaming responses, the release function is called when the stream ends
  * to properly respect provider concurrency limits.
  */
-function formatResponse(response: any, reply: FastifyReply, body: any, release?: () => void) {
+async function formatResponse(response: any, reply: FastifyReply, body: any, release?: () => void) {
   // Set HTTP status code
   if (!response.ok) {
     reply.code(response.status);
@@ -555,8 +556,9 @@ function formatResponse(response: any, reply: FastifyReply, body: any, release?:
     reply.header("Content-Type", "text/event-stream");
     reply.header("Cache-Control", "no-cache");
     reply.header("Connection", "keep-alive");
+    reply.hijack();
     if (response.body) {
-      const traced = traceStream({
+      const traced = await traceStream({
         reqId: (reply.request as any).id,
         stream: response.body,
         phase: "sse_to_client",
@@ -567,21 +569,20 @@ function formatResponse(response: any, reply: FastifyReply, body: any, release?:
 
       // Wrap the stream to release the semaphore when the stream ends
       if (release) {
-        const originalStream = traced as any;
-        const wrappedStream = wrapStreamWithRelease(originalStream, release);
-        return reply.send(wrappedStream as any);
+        const wrappedStream = wrapStreamWithRelease(traced as any, release);
+        return pipeStreamToReply(toNodeStream(wrappedStream), reply);
       }
 
-      return reply.send(traced as any);
+      return pipeStreamToReply(toNodeStream(traced), reply);
     }
 
     if (release) {
       const originalStream = response.body as any;
       const wrappedStream = wrapStreamWithRelease(originalStream, release);
-      return reply.send(wrappedStream as any);
+      return pipeStreamToReply(toNodeStream(wrappedStream), reply);
     }
 
-    return reply.send(response.body);
+    return pipeStreamToReply(toNodeStream(response.body), reply);
   } else {
     // Handle regular JSON response — release immediately since response is complete
     try {
@@ -656,6 +657,28 @@ function wrapStreamWithRelease(stream: any, release: () => void): any {
   // Unknown stream type — just release immediately after a short delay
   safeRelease();
   return stream;
+}
+
+function toNodeStream(stream: any): any {
+  if (!stream) return stream;
+  if (typeof stream.on === "function") return stream;
+  if (typeof Readable.fromWeb === "function" && typeof stream.getReader === "function") {
+    return Readable.fromWeb(stream as any);
+  }
+  return stream;
+}
+
+function pipeStreamToReply(stream: any, reply: FastifyReply): FastifyReply {
+  if (stream && typeof stream.pipe === "function") {
+    stream.on?.("error", (err: Error) => {
+      reply.raw.destroy(err);
+    });
+    stream.pipe(reply.raw);
+    return reply;
+  }
+
+  reply.raw.end(typeof stream === "string" ? stream : "");
+  return reply;
 }
 
 export const registerApiRoutes = async (
