@@ -2,9 +2,321 @@ import { ProxyAgent } from "undici";
 import { UnifiedChatRequest } from "../types/llm";
 import { redactHeaders, traceLog, traceStream } from "./trace-logger";
 import { createHash } from "node:crypto";
+import { appendFileSync, mkdirSync, existsSync } from "node:fs";
+import { join } from "node:path";
 
 let lastRequestBodySha256: string | null = null;
 let lastRequestBodySha256AtMs = 0;
+
+const cacheDebugRequestSummaries = new Map<string, Record<string, unknown>>();
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(",")}]`;
+  }
+
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, item]) => `${JSON.stringify(key)}:${stableStringify(item)}`)
+      .join(",")}}`;
+  }
+
+  return JSON.stringify(value);
+}
+
+function sha256Short(value: unknown): string {
+  return createHash("sha256").update(stableStringify(value)).digest("hex").slice(0, 16);
+}
+
+function getContentLength(content: any): number {
+  if (typeof content === "string") return content.length;
+  if (Array.isArray(content)) {
+    return content.reduce((sum, item) => {
+      if (item?.type === "text" && typeof item.text === "string") {
+        return sum + item.text.length;
+      }
+      if (typeof item?.content === "string") {
+        return sum + item.content.length;
+      }
+      return sum + JSON.stringify(item || "").length;
+    }, 0);
+  }
+  return JSON.stringify(content || "").length;
+}
+
+function collectCacheControlLocations(request: any, messages: any[]): Array<Record<string, unknown>> {
+  const locations: Array<Record<string, unknown>> = [];
+
+  const scanBlocks = (blocks: any, base: Record<string, unknown>) => {
+    if (!Array.isArray(blocks)) return;
+    blocks.forEach((block: any, blockIndex: number) => {
+      if (block?.cache_control) {
+        locations.push({
+          ...base,
+          blockIndex,
+          type: block?.type || "object",
+          length: getContentLength([block]),
+        });
+      }
+    });
+  };
+
+  if (Array.isArray(request?.system)) {
+    scanBlocks(request.system, { location: "system" });
+  }
+
+  if (Array.isArray(request?.tools)) {
+    request.tools.forEach((tool: any, toolIndex: number) => {
+      if (tool?.cache_control) {
+        locations.push({
+          location: "tool",
+          toolIndex,
+          name: tool?.name || tool?.function?.name,
+          length: JSON.stringify(tool || {}).length,
+        });
+      }
+    });
+  }
+
+  messages.forEach((message: any, messageIndex: number) => {
+    const content = message?.content;
+    if (message?.cache_control) {
+      locations.push({ messageIndex, role: message?.role, location: "message" });
+    }
+    if (!Array.isArray(content)) return;
+    content.forEach((block: any, blockIndex: number) => {
+      if (block?.cache_control) {
+        locations.push({
+          location: "message_content",
+          messageIndex,
+          blockIndex,
+          role: message?.role,
+          type: block?.type,
+          length: getContentLength([block]),
+        });
+      }
+    });
+  });
+  return locations;
+}
+
+function getCacheDebugLogPath(): string {
+  const dir = process.env.CCR_CACHE_DEBUG_DIR ||
+    join(process.env.USERPROFILE || process.env.HOME || ".", ".claude-code-router", "logs");
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true });
+  }
+  const date = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  return join(dir, `cache-debug-${date}.jsonl`);
+}
+
+function estimateTokensFromChars(chars: number): number {
+  // Rough estimator only for attribution. Anthropic tokenization differs, but this is
+  // enough to identify whether a 30k-token gap comes from tools/system/messages.
+  return Math.ceil(chars / 2);
+}
+
+function summarizeRequestForCacheAttribution(request: any): Record<string, unknown> {
+  const system = Array.isArray(request?.system) ? request.system : [];
+  const tools = Array.isArray(request?.tools) ? request.tools : [];
+  const messages = Array.isArray(request?.messages) ? request.messages : [];
+
+  const systemChars = system.reduce((sum: number, block: any) => {
+    return sum + (typeof block?.text === "string" ? block.text.length : JSON.stringify(block || "").length);
+  }, 0);
+  const toolsChars = JSON.stringify(tools || []).length;
+  const messagesChars = messages.reduce((sum: number, msg: any) => sum + getContentLength(msg?.content), 0);
+
+  const sections = {
+    system: { chars: systemChars, estTokens: estimateTokensFromChars(systemChars), hash: sha256Short(system) },
+    tools: { chars: toolsChars, estTokens: estimateTokensFromChars(toolsChars), hash: sha256Short(tools) },
+    messages: { chars: messagesChars, estTokens: estimateTokensFromChars(messagesChars), hash: sha256Short(messages) },
+  };
+
+  const cacheControls = collectCacheControlLocations(request, messages);
+  const breakpointCandidates = cacheControls.map((location: any) => {
+    let likelyCoverage = "unknown";
+    if (location.location === "system") {
+      likelyCoverage = "system-only-or-prefix-through-system";
+    } else if (location.location === "tool") {
+      likelyCoverage = "tools-only-or-prefix-through-tools";
+    } else if (location.location === "message_content") {
+      likelyCoverage = "prefix-through-message-content";
+    }
+    return { ...location, likelyCoverage };
+  });
+
+  const bodyJson = JSON.stringify(request);
+  const withoutCacheControl = JSON.parse(bodyJson, (key, value) => key === "cache_control" ? undefined : value);
+
+  return {
+    sections,
+    wire: {
+      bodyBytes: Buffer.byteLength(bodyJson, "utf8"),
+      bodyHash: createHash("sha256").update(bodyJson).digest("hex").slice(0, 16),
+      bodyNoCacheControlHash: sha256Short(withoutCacheControl),
+      systemBytes: Buffer.byteLength(JSON.stringify(request?.system || []), "utf8"),
+      toolsBytes: Buffer.byteLength(JSON.stringify(tools || []), "utf8"),
+      messagesBytes: Buffer.byteLength(JSON.stringify(messages || []), "utf8"),
+    },
+    cacheControls,
+    breakpointCandidates,
+    fullBodyHash: sha256Short(request),
+  };
+}
+
+function appendCacheDebugRecord(record: Record<string, unknown>): void {
+  appendFileSync(getCacheDebugLogPath(), JSON.stringify(record) + "\n", "utf-8");
+}
+
+export function writeCacheUsageDebug(reqId: string | undefined, usage: Record<string, unknown>, meta: Record<string, unknown> = {}): void {
+  if (process.env.CCR_CACHE_DEBUG !== "1") return;
+  try {
+    const requestSummary = reqId ? cacheDebugRequestSummaries.get(reqId) : undefined;
+    appendCacheDebugRecord({
+      ts: new Date().toISOString(),
+      kind: "cache_usage_attribution",
+      reqId,
+      usage,
+      meta,
+      requestSummary,
+    });
+  } catch {
+    // ignore debug log errors
+  }
+}
+
+function writeCacheDebugLog(reqId: string | undefined, request: any, summary: Record<string, unknown>): void {
+  try {
+    const system = request?.system;
+    const tools = request?.tools;
+    const messages = Array.isArray(request?.messages) ? request.messages : [];
+
+    // Compute per-block hashes for system
+    const systemBlocks = Array.isArray(system) ? system.map((block: any, i: number) => ({
+      index: i,
+      type: block?.type,
+      length: typeof block?.text === "string" ? block.text.length : JSON.stringify(block || "").length,
+      hasCacheControl: !!block?.cache_control,
+      hash: sha256Short(block),
+      preview: typeof block?.text === "string" ? block.text.slice(0, 80) + "..." : undefined,
+    })) : typeof system === "string" ? [{ type: "string", length: system.length, hash: sha256Short(system) }] : [];
+
+    // Compute per-tool hash (just first and last for brevity)
+    const toolsSummary = Array.isArray(tools) ? {
+      count: tools.length,
+      names: tools.map((tool: any) => tool?.name || tool?.function?.name).filter(Boolean),
+      totalChars: JSON.stringify(tools).length,
+      lastToolHash: tools.length > 0 ? sha256Short(tools[tools.length - 1]) : undefined,
+      lastToolHasCacheControl: tools.length > 0 ? !!tools[tools.length - 1]?.cache_control : false,
+      allToolsHash: sha256Short(tools),
+    } : undefined;
+
+    // Per-message structure (content hash, cache_control presence)
+    const messagesDetail = messages.map((msg: any, i: number) => {
+      const content = msg?.content;
+      const blocks = Array.isArray(content) ? content : [];
+      return {
+        index: i,
+        role: msg?.role,
+        blockCount: blocks.length,
+        totalLength: getContentLength(content),
+        contentHash: sha256Short(content),
+        blocks: blocks.slice(0, 3).map((b: any, j: number) => ({
+          index: j,
+          type: b?.type,
+          length: typeof b?.text === "string" ? b.text.length :
+                  typeof b?.content === "string" ? b.content.length :
+                  JSON.stringify(b || "").length,
+          hasCacheControl: !!b?.cache_control,
+          hash: sha256Short(b),
+        })),
+      };
+    });
+
+    // Full body hash (what actually gets sent)
+    const fullBodyHash = sha256Short(request);
+    const cacheAttributionSummary = summarizeRequestForCacheAttribution(request);
+    if (reqId) {
+      cacheDebugRequestSummaries.set(reqId, cacheAttributionSummary);
+      // Avoid unbounded growth in long-running processes.
+      if (cacheDebugRequestSummaries.size > 200) {
+        const oldestKey = cacheDebugRequestSummaries.keys().next().value;
+        if (oldestKey) cacheDebugRequestSummaries.delete(oldestKey);
+      }
+    }
+
+    const record = {
+      ts: new Date().toISOString(),
+      kind: "cache_request_structure",
+      reqId,
+      fullBodyHash,
+      cacheAttributionSummary,
+      systemBlocks,
+      toolsSummary,
+      messagesDetail,
+      summary,
+    };
+
+    appendCacheDebugRecord(record);
+  } catch {
+    // Silently ignore debug log errors
+  }
+}
+
+function buildCacheTraceSummary(request: any): Record<string, unknown> {
+  const messages = Array.isArray(request?.messages) ? request.messages : [];
+  const systemMessages = messages.filter((message: any) => message?.role === "system");
+  const nonSystemMessages = messages.filter((message: any) => message?.role !== "system");
+  const tools = Array.isArray(request?.tools) ? request.tools : [];
+  const prefixMessages = nonSystemMessages.slice(0, Math.max(0, nonSystemMessages.length - 1));
+  const messageLengths = messages.map((message: any, index: number) => ({
+    index,
+    role: message?.role,
+    length: getContentLength(message?.content),
+  }));
+  const largestMessages = [...messageLengths]
+    .sort((a, b) => b.length - a.length)
+    .slice(0, 5);
+
+  // Hash message[0] separately to detect dynamic content injection (e.g. timestamps)
+  const message0Hash = messages.length > 0 ? sha256Short(messages[0]?.content) : undefined;
+  // Capture head/tail of message[0] content for visual diff across requests
+  const message0Preview = (() => {
+    if (messages.length === 0) return undefined;
+    const content = messages[0]?.content;
+    let text = "";
+    if (typeof content === "string") {
+      text = content;
+    } else if (Array.isArray(content) && content[0]?.text) {
+      text = content[0].text;
+    }
+    if (!text) return undefined;
+    const head = text.slice(0, 120);
+    const tail = text.slice(-120);
+    return { head, tail };
+  })();
+
+  return {
+    model: request?.model,
+    stream: request?.stream,
+    streamIncludeUsage: request?.stream_options?.include_usage === true,
+    messageCount: messages.length,
+    systemCount: systemMessages.length,
+    toolCount: tools.length,
+    totalMessageChars: messageLengths.reduce((sum, item) => sum + item.length, 0),
+    prefixChars: prefixMessages.reduce((sum: number, message: any) => sum + getContentLength(message?.content), 0),
+    largestMessages,
+    cacheControlLocations: collectCacheControlLocations(request, messages),
+    systemHash: sha256Short(systemMessages),
+    toolsHash: sha256Short(tools),
+    message0Hash,
+    message0Preview,
+    prefixHash: sha256Short(prefixMessages),
+    fullMessagesHash: sha256Short(messages),
+  };
+}
 
 export function sendUnifiedRequest(
   url: URL | string,
@@ -48,6 +360,22 @@ export function sendUnifiedRequest(
     headerObject[key] = value;
   });
 
+  const cacheTraceSummary = buildCacheTraceSummary(request);
+
+  // CACHE_DEBUG: write detailed request body analysis to a separate log file
+  if (process.env.CCR_CACHE_DEBUG === "1") {
+    writeCacheDebugLog(context?.req?.id, request, cacheTraceSummary);
+  }
+
+  logger?.info?.(
+    {
+      reqId: context?.req?.id,
+      requestUrl: typeof url === "string" ? url : url.toString(),
+      cacheTraceSummary,
+    },
+    "upstream cache trace"
+  );
+
   traceLog({
     phase: "upstream_request",
     reqId: context?.req?.id,
@@ -55,6 +383,7 @@ export function sendUnifiedRequest(
     method: fetchOptions.method,
     headers: redactHeaders(headerObject),
     body: request,
+    cacheTraceSummary,
     useProxy: config.httpsProxy,
   });
 

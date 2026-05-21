@@ -119,6 +119,7 @@ export class ProviderService {
           apiKey: normalizedProviderConfig.api_key,
           models: normalizedProviderConfig.models || [],
           maxConcurrency: normalizedProviderConfig.max_concurrency,
+          options: (normalizedProviderConfig as any).options,
           transformer: this.hasTransformerEntries(transformer)
             ? transformer
             : undefined,
@@ -134,8 +135,28 @@ export class ProviderService {
   private normalizeProviderConfig(
     providerConfig: ConfigProvider & { api?: string }
   ): ConfigProvider {
-    const apiTransformerName =
+    const requestedApiTransformerName =
       typeof providerConfig.api === "string" ? providerConfig.api.trim() : "";
+    const baseUrlLower = (providerConfig.api_base_url || "").toLowerCase();
+    const hasClaudeModel = (providerConfig.models || []).some((entry: ModelEntry) =>
+      normalizeModelName(entry).toLowerCase().startsWith("claude-")
+    );
+    const apiTransformerName =
+      requestedApiTransformerName.toLowerCase() === "openai" &&
+      hasClaudeModel &&
+      baseUrlLower.includes("api.opeapi.cn") &&
+      this.transformerService.hasTransformer("Anthropic")
+        ? "Anthropic"
+        : requestedApiTransformerName;
+
+    if (
+      apiTransformerName !== requestedApiTransformerName &&
+      requestedApiTransformerName
+    ) {
+      this.logger.info(
+        `Provider '${providerConfig.name}' uses OpenAI-compatible endpoint for Claude model on opeapi.cn; routing upstream via Anthropic transformer to preserve prompt cache`
+      );
+    }
 
     if (!apiTransformerName) {
       return providerConfig;

@@ -14,6 +14,7 @@ import { v4 as uuidv4 } from "uuid";
 import { getThinkLevel } from "@/utils/thinking";
 import { createApiError } from "@/api/middleware";
 import { formatBase64 } from "@/utils/image";
+import { writeCacheUsageDebug } from "@/utils/request";
 
 export class AnthropicTransformer implements Transformer {
   name = "Anthropic";
@@ -240,6 +241,213 @@ export class AnthropicTransformer implements Transformer {
         headers: { "Content-Type": "application/json" },
       });
     }
+  }
+
+  async transformRequestIn(
+    request: UnifiedChatRequest,
+    provider: LLMProvider
+  ): Promise<{ body: Record<string, any>; config: { url: URL; headers: Record<string, string | undefined> } }> {
+    const systemParts: any[] = [];
+    const messages: any[] = [];
+
+    for (const message of request.messages || []) {
+      if (message.role === "system") {
+        if (typeof message.content === "string") {
+          systemParts.push({
+            type: "text",
+            text: message.content,
+            ...(message.cache_control ? { cache_control: message.cache_control } : {}),
+          });
+        } else if (Array.isArray(message.content)) {
+          systemParts.push(
+            ...message.content
+              .filter((item: any) => item.type === "text" && item.text)
+              .map((item: any) => ({
+                type: "text",
+                text: item.text,
+                ...(item.cache_control ? { cache_control: item.cache_control } : {}),
+              }))
+          );
+        }
+        continue;
+      }
+
+      if (message.role === "tool") {
+        messages.push({
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: message.tool_call_id,
+              content:
+                typeof message.content === "string"
+                  ? message.content
+                  : JSON.stringify(message.content ?? ""),
+              ...(message.cache_control ? { cache_control: message.cache_control } : {}),
+            },
+          ],
+        });
+        continue;
+      }
+
+      if (message.role === "assistant" && message.tool_calls?.length) {
+        const content: any[] = [];
+        if (this.hasMessageContent(message.content)) {
+          content.push(...this.convertUnifiedContentToAnthropic(message.content));
+        }
+        for (const toolCall of message.tool_calls) {
+          let input: any = {};
+          try {
+            input = JSON.parse(toolCall.function.arguments || "{}");
+          } catch {
+            input = { text: toolCall.function.arguments || "" };
+          }
+          content.push({
+            type: "tool_use",
+            id: toolCall.id,
+            name: toolCall.function.name,
+            input,
+          });
+        }
+        messages.push({ role: "assistant", content });
+        continue;
+      }
+
+      if (message.role === "user" || message.role === "assistant") {
+        messages.push({
+          role: message.role,
+          content: this.convertUnifiedContentToAnthropic(message.content),
+        });
+      }
+    }
+
+    const body: Record<string, any> = {
+      model: request.model,
+      messages,
+      max_tokens: request.max_tokens ?? 4096,
+      temperature: request.temperature,
+      stream: request.stream,
+    };
+
+    if (systemParts.length === 1) {
+      body.system = systemParts[0].cache_control ? systemParts : systemParts[0].text;
+    } else if (systemParts.length > 1) {
+      body.system = systemParts;
+    }
+
+    const toolAllowList =
+      provider.options?.toolAllowList ||
+      provider.options?.allowedTools ||
+      this.getAutoToolAllowList(request, provider);
+    const allowedToolNames = Array.isArray(toolAllowList) && toolAllowList.length > 0
+      ? new Set(toolAllowList)
+      : undefined;
+    const filteredTools = request.tools?.filter((tool) => {
+      const name = tool?.function?.name;
+      return !allowedToolNames || allowedToolNames.has(name);
+    });
+
+    if (filteredTools?.length) {
+      body.tools = filteredTools.map((tool) => ({
+        name: tool.function.name,
+        description: tool.function.description || "",
+        input_schema: tool.function.parameters,
+      }));
+    }
+
+    if (request.tool_choice && body.tools?.length) {
+      if (typeof request.tool_choice === "object" && "function" in request.tool_choice) {
+        const chosenToolName = request.tool_choice.function.name;
+        if (body.tools.some((tool: any) => tool.name === chosenToolName)) {
+          body.tool_choice = {
+            type: "tool",
+            name: chosenToolName,
+          };
+        }
+      } else if (request.tool_choice === "required") {
+        body.tool_choice = { type: "any" };
+      } else if (request.tool_choice === "auto" || request.tool_choice === "none") {
+        body.tool_choice = { type: request.tool_choice };
+      }
+    }
+
+    if (request.reasoning?.enabled) {
+      body.thinking = {
+        type: "enabled",
+        budget_tokens: request.reasoning.max_tokens ?? 1024,
+      };
+    }
+
+    // When the provider doesn't support message-level cache_control (e.g. opeapi.cn),
+    // hoist the large first user message into system so it becomes part of the
+    // system-level cache prefix. This moves ~30,000 tokens from uncached input into cache.
+    const enableMessageBreakpoints =
+      provider?.options?.cacheMessagesBreakpoint ??
+      (process.env.CCR_CACHE_MESSAGES_BREAKPOINT === "1");
+    const shouldHoistLargeUserMessage = !enableMessageBreakpoints;
+    if (shouldHoistLargeUserMessage) {
+      this.hoistLargeUserMessageToSystem(body);
+      this.seedFirstHoistedTurnForCacheWarmup(body, provider);
+    }
+    this.ensureAnthropicCacheBreakpoints(body, provider);
+
+    return {
+      body,
+      config: {
+        url: this.buildMessagesUrl(provider.baseUrl),
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "Accept": "text/event-stream, application/json, */*",
+          "anthropic-version": "2023-06-01",
+          "x-api-key": provider.apiKey,
+          "Authorization": undefined,
+          "authorization": undefined,
+        },
+      },
+    };
+  }
+
+  async transformResponseOut(
+    response: Response,
+    context: TransformerContext
+  ): Promise<Response> {
+    const contentType = response.headers.get("Content-Type") || "";
+
+    if (contentType.includes("text/event-stream")) {
+      if (!response.body) return response;
+      const convertedStream = await this.convertAnthropicStreamToOpenAI(
+        response.body,
+        context
+      );
+      return new Response(convertedStream, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+        },
+      });
+    }
+
+    if (contentType.includes("application/json")) {
+      const data = await response.json();
+      if (data?.choices || data?.error) {
+        return new Response(JSON.stringify(data), {
+          status: response.status,
+          statusText: response.statusText,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      const openAIResponse = this.convertAnthropicResponseToOpenAI(data);
+      return new Response(JSON.stringify(openAIResponse), {
+        status: response.status,
+        statusText: response.statusText,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    return response;
   }
 
   private convertAnthropicToolsToUnified(tools: any[]): UnifiedTool[] {
@@ -1009,6 +1217,618 @@ export class AnthropicTransformer implements Transformer {
     });
 
     return readable;
+  }
+
+  /**
+   * Hoist a large first user message into the system field for better cache utilization.
+   *
+   * Many API proxies (e.g. opeapi.cn) only cache system + tools but ignore cache_control
+   * on messages content blocks. By moving the large, stable first user message into system,
+   * it becomes part of the system-level cache prefix.
+   *
+   * Conditions:
+   * - messages[0] is role "user" with a single large text block (≥10000 chars)
+   * - messages[1] exists (so removing messages[0] won't leave messages empty)
+   *
+   * After hoisting, a minimal user placeholder is left at messages[0] to satisfy
+   * Anthropic's requirement that messages must start with a user turn.
+   */
+  private getAutoToolAllowList(request: UnifiedChatRequest, provider?: LLMProvider): string[] | undefined {
+    if (!provider?.options?.autoToolFilter) return undefined;
+
+    const text = (request.messages || [])
+      .map((message: any) => {
+        const content = message?.content;
+        if (typeof content === "string") return content;
+        if (Array.isArray(content)) {
+          return content.map((block: any) => block?.text || block?.content || "").join("\n");
+        }
+        return "";
+      })
+      .join("\n")
+      .toLowerCase();
+
+    const looksLikeFileTask =
+      /[a-z]:\\/.test(text) ||
+      /\.(txt|md|json|ts|tsx|js|jsx|py|yaml|yml|toml|log)\b/.test(text) ||
+      /读|写|文件|目录|搜索|替换|修改|读取|写入|read|write|file|dir|search|replace|edit/.test(text);
+
+    if (!looksLikeFileTask) return undefined;
+
+    return [
+      "list_dir",
+      "search_file",
+      "search_content",
+      "read_file",
+      "read_lints",
+      "replace_in_file",
+      "write_to_file",
+      "execute_command",
+    ];
+  }
+
+  private hoistLargeUserMessageToSystem(body: Record<string, any>): void {
+    const HOIST_THRESHOLD = 10000;
+    const messages = body.messages;
+    if (!Array.isArray(messages) || messages.length === 0) return;
+
+    const first = messages[0];
+    if (first?.role !== "user") return;
+    if (!Array.isArray(first.content) || first.content.length === 0) return;
+
+    // Only hoist if it's a single text block (typical system context injection)
+    const textBlocks = first.content.filter((b: any) => b.type === "text");
+    if (textBlocks.length !== 1) return;
+
+    const textBlock = textBlocks[0];
+    const text = typeof textBlock.text === "string" ? textBlock.text : "";
+    if (text.length < HOIST_THRESHOLD) return;
+
+    // Split stable context from volatile turn data. CodeBuddy puts dynamic data near
+    // the end (<additional_data>, <user_query>). Hoisting those volatile blocks makes
+    // every new user query/time produce a new cache key, so the first request cannot
+    // reuse prior cache. Keep dynamic tail in messages[0], hoist only stable prefix.
+    const markerCandidates = ["\n<additional_data>", "<additional_data>", "\n<user_query>", "<user_query>"];
+    const splitIndex = markerCandidates
+      .map((marker) => text.indexOf(marker))
+      .filter((index) => index >= 0)
+      .sort((a, b) => a - b)[0];
+
+    const stableText = splitIndex === undefined ? text : text.slice(0, splitIndex).trimEnd();
+    const dynamicText = splitIndex === undefined ? "." : text.slice(splitIndex).trimStart();
+    if (stableText.length < HOIST_THRESHOLD) return;
+
+    const systemBlock = {
+      type: "text",
+      text: stableText,
+    };
+
+    if (!Array.isArray(body.system)) {
+      body.system = body.system ? [{ type: "text", text: body.system }] : [];
+    }
+    body.system.push(systemBlock);
+
+    first.content = [{ type: "text", text: dynamicText || "." }];
+  }
+
+
+  private seedFirstHoistedTurnForCacheWarmup(body: Record<string, any>, provider?: LLMProvider): void {
+    if (!provider?.options?.cacheWarmupFirstTurn) return;
+    const messages = body.messages;
+    if (!Array.isArray(messages) || messages.length !== 1) return;
+    const first = messages[0];
+    if (first?.role !== "user") return;
+    if (!Array.isArray(first.content) || first.content.length !== 1) return;
+    const firstText = first.content[0]?.type === "text" ? first.content[0]?.text : undefined;
+    if (firstText !== ".") return;
+
+    messages.push(
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "Context received." }],
+      },
+      {
+        role: "user",
+        content: [{ type: "text", text: "Continue." }],
+      }
+    );
+  }
+
+  private ensureAnthropicCacheBreakpoints(
+    body: Record<string, any>,
+    provider?: LLMProvider,
+    options: { skipToolsBreakpoint?: boolean; skipSystemBreakpoint?: boolean } = {}
+  ): void {
+    const MAX_CACHE_BREAKPOINTS = 4;
+
+    const countCacheControls = (value: any): number => {
+      if (!value) return 0;
+      if (Array.isArray(value)) {
+        return value.reduce((sum, item) => sum + countCacheControls(item), 0);
+      }
+      if (typeof value === "object") {
+        return (
+          (value.cache_control ? 1 : 0) +
+          Object.entries(value)
+            .filter(([key]) => key !== "cache_control")
+            .reduce((sum, [, item]) => sum + countCacheControls(item), 0)
+        );
+      }
+      return 0;
+    };
+
+    const blockTextLength = (block: any): number => {
+      if (!block || typeof block !== "object") return 0;
+      if (block.type === "text" && typeof block.text === "string") {
+        return block.text.length;
+      }
+      if (block.type === "tool_result") {
+        if (typeof block.content === "string") return block.content.length;
+        return JSON.stringify(block.content || "").length;
+      }
+      return 0;
+    };
+
+    let cacheControlCount = countCacheControls(body.system) + countCacheControls(body.tools) + countCacheControls(body.messages);
+    const addCacheControl = (block: any) => {
+      if (
+        cacheControlCount >= MAX_CACHE_BREAKPOINTS ||
+        !block ||
+        typeof block !== "object" ||
+        block.cache_control
+      ) {
+        return false;
+      }
+      block.cache_control = { type: "ephemeral" };
+      cacheControlCount++;
+      return true;
+    };
+
+    if (!options.skipToolsBreakpoint && Array.isArray(body.tools) && body.tools.length > 0) {
+      addCacheControl(body.tools[body.tools.length - 1]);
+    }
+
+    if (!options.skipSystemBreakpoint && Array.isArray(body.system) && body.system.length > 0) {
+      body.system.forEach((block: any) => addCacheControl(block));
+    } else if (!options.skipSystemBreakpoint && typeof body.system === "string" && body.system.length > 0) {
+      body.system = [
+        {
+          type: "text",
+          text: body.system,
+          cache_control: { type: "ephemeral" },
+        },
+      ];
+      cacheControlCount++;
+    }
+
+    // Many API proxies (e.g. opeapi.cn) only honor cache_control on system and tools,
+    // ignoring it on message content blocks. Placing breakpoints on messages in that case
+    // causes cache misses: req-1 writes a prefix of system+tools (45,922 tokens), but
+    // req-2 writes system+tools+message[0] (46,320 tokens) — a different prefix that
+    // doesn't match req-1's cache. By skipping message-level breakpoints entirely, all
+    // requests share the same cache prefix (system+tools) and hit from req-2 onward.
+    //
+    // Control hierarchy (first truthy wins):
+    //   1. Provider-level: provider.options.cacheMessagesBreakpoint (in config.json per-provider)
+    //   2. Global: CACHE_MESSAGES_BREAKPOINT=true in config.json (sets CCR_CACHE_MESSAGES_BREAKPOINT=1)
+    //   3. Default: false (skip message-level breakpoints)
+    const enableMessageBreakpoints =
+      provider?.options?.cacheMessagesBreakpoint ??
+      (process.env.CCR_CACHE_MESSAGES_BREAKPOINT === "1");
+
+    if (enableMessageBreakpoints) {
+      const MIN_CACHEABLE_CHARS = 1200;
+      const LARGE_FIRST_MSG_CHARS = 10000;
+
+      const messages = Array.isArray(body.messages) ? body.messages : [];
+      const lastIndex = messages.length - 1;
+      let stableEndIndex = messages[lastIndex]?.role === "user" ? lastIndex - 1 : lastIndex;
+      if (stableEndIndex < 0 && messages[0]?.role === "user") {
+        const firstContent = Array.isArray(messages[0]?.content) ? messages[0].content : [];
+        const firstBlockLen = firstContent.length > 0 ? blockTextLength(firstContent[0]) : 0;
+        if (firstBlockLen >= LARGE_FIRST_MSG_CHARS) {
+          stableEndIndex = 0;
+        }
+      }
+      const candidates: Array<{ block: any; length: number; position: number }> = [];
+
+      for (let i = 0; i <= stableEndIndex; i++) {
+        const message = messages[i];
+        if (!Array.isArray(message?.content)) continue;
+        for (let j = 0; j < message.content.length; j++) {
+          const block = message.content[j];
+          if (block?.cache_control) continue;
+          if (block?.type !== "text" && block?.type !== "tool_result") continue;
+          const length = blockTextLength(block);
+          if (length < MIN_CACHEABLE_CHARS) continue;
+          candidates.push({
+            block,
+            length,
+            position: i * 1000 + j,
+          });
+        }
+      }
+
+      candidates
+        .sort((a, b) => b.length - a.length || a.position - b.position)
+        .forEach((candidate) => {
+          addCacheControl(candidate.block);
+        });
+    }
+  }
+
+  private buildMessagesUrl(baseUrl: string): URL {
+    const url = new URL(baseUrl);
+    const normalizedPath = url.pathname.replace(/\/+$/, "");
+
+    if (normalizedPath.endsWith("/messages")) {
+      return url;
+    }
+
+    if (!normalizedPath || normalizedPath === "/") {
+      url.pathname = "/v1/messages";
+      return url;
+    }
+
+    if (normalizedPath.endsWith("/v1")) {
+      url.pathname = `${normalizedPath}/messages`;
+      return url;
+    }
+
+    url.pathname = `${normalizedPath}/messages`;
+    return url;
+  }
+
+  private hasMessageContent(content: UnifiedMessage["content"]): boolean {
+    if (typeof content === "string") return content.length > 0;
+    return Array.isArray(content) && content.length > 0;
+  }
+
+  private convertUnifiedContentToAnthropic(content: UnifiedMessage["content"]): any[] {
+    if (typeof content === "string") {
+      return [{ type: "text", text: content }];
+    }
+
+    if (!Array.isArray(content)) {
+      return [];
+    }
+
+    return content
+      .map((item: any) => {
+        if (item.type === "text") {
+          return {
+            type: "text",
+            text: item.text || "",
+            ...(item.cache_control ? { cache_control: item.cache_control } : {}),
+          };
+        }
+
+        if (item.type === "image_url") {
+          const url = item.image_url?.url || "";
+          if (url.startsWith("data:")) {
+            const match = url.match(/^data:([^;]+);base64,(.*)$/);
+            if (match) {
+              return {
+                type: "image",
+                source: {
+                  type: "base64",
+                  media_type: match[1],
+                  data: match[2],
+                },
+              };
+            }
+          }
+
+          return {
+            type: "image",
+            source: {
+              type: "url",
+              url,
+            },
+          };
+        }
+
+        return null;
+      })
+      .filter(Boolean);
+  }
+
+  private convertAnthropicResponseToOpenAI(data: any): any {
+    if (data?.error) {
+      return { error: data.error };
+    }
+
+    const contentParts = Array.isArray(data?.content) ? data.content : [];
+    const text = contentParts
+      .filter((part: any) => part.type === "text" && typeof part.text === "string")
+      .map((part: any) => part.text)
+      .join("");
+
+    const toolCalls = contentParts
+      .filter((part: any) => part.type === "tool_use")
+      .map((part: any) => ({
+        id: part.id,
+        type: "function",
+        function: {
+          name: part.name || "",
+          arguments: JSON.stringify(part.input || {}),
+        },
+      }));
+
+    const stopReasonMapping: Record<string, string> = {
+      end_turn: "stop",
+      max_tokens: "length",
+      tool_use: "tool_calls",
+      stop_sequence: "stop",
+    };
+
+    return {
+      id: data?.id || `chatcmpl-${Date.now()}`,
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: data?.model || "",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: text || null,
+            ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+          },
+          logprobs: null,
+          finish_reason:
+            stopReasonMapping[data?.stop_reason] ||
+            (toolCalls.length ? "tool_calls" : "stop"),
+        },
+      ],
+      usage: {
+        prompt_tokens: data?.usage?.input_tokens || 0,
+        completion_tokens: data?.usage?.output_tokens || 0,
+        total_tokens:
+          (data?.usage?.input_tokens || 0) + (data?.usage?.output_tokens || 0),
+        prompt_tokens_details: {
+          cached_tokens: data?.usage?.cache_read_input_tokens || 0,
+        },
+      },
+    };
+  }
+
+  private async convertAnthropicStreamToOpenAI(
+    anthropicStream: ReadableStream,
+    context: TransformerContext
+  ): Promise<ReadableStream> {
+    return new ReadableStream({
+      start: async (controller) => {
+        const reader = anthropicStream.getReader();
+        const decoder = new TextDecoder();
+        const encoder = new TextEncoder();
+        let buffer = "";
+        let messageId = `chatcmpl-${Date.now()}`;
+        let model = "";
+        let currentToolCall: { id: string; name: string } | null = null;
+        let inputTokens = 0;
+        let outputTokens = 0;
+        let finished = false;
+
+        const enqueueChunk = (chunk: any) => {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+        };
+
+        const finish = () => {
+          if (finished) return;
+          finished = true;
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        };
+
+        const finishReasonMapping: Record<string, string> = {
+          end_turn: "stop",
+          max_tokens: "length",
+          tool_use: "tool_calls",
+          stop_sequence: "stop",
+        };
+
+        const handleEvent = (event: any) => {
+          if (event?.error) {
+            enqueueChunk({ error: event.error });
+            return;
+          }
+
+          if (event.type === "message_start") {
+            writeCacheUsageDebug(context?.req?.id, event.message?.usage || {}, {
+              source: "anthropic_sse_message_start",
+              messageId: event.message?.id,
+            });
+            messageId = event.message?.id || messageId;
+            model = event.message?.model || model;
+            inputTokens = event.message?.usage?.input_tokens || inputTokens;
+            outputTokens = event.message?.usage?.output_tokens || outputTokens;
+            enqueueChunk({
+              id: messageId,
+              object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000),
+              model,
+              choices: [
+                {
+                  index: 0,
+                  delta: { role: "assistant" },
+                  finish_reason: null,
+                },
+              ],
+            });
+            return;
+          }
+
+          if (event.type === "content_block_start") {
+            const block = event.content_block;
+            if (block?.type === "tool_use") {
+              currentToolCall = {
+                id: block.id || `call_${Date.now()}`,
+                name: block.name || "",
+              };
+              enqueueChunk({
+                id: messageId,
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000),
+                model,
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      tool_calls: [
+                        {
+                          index: 0,
+                          id: currentToolCall.id,
+                          type: "function",
+                          function: {
+                            name: currentToolCall.name,
+                            arguments: "",
+                          },
+                        },
+                      ],
+                    },
+                    finish_reason: null,
+                  },
+                ],
+              });
+            }
+            return;
+          }
+
+          if (event.type === "content_block_delta") {
+            const delta = event.delta;
+            if (delta?.type === "text_delta") {
+              enqueueChunk({
+                id: messageId,
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000),
+                model,
+                choices: [
+                  {
+                    index: 0,
+                    delta: { content: delta.text || "" },
+                    finish_reason: null,
+                  },
+                ],
+              });
+            } else if (delta?.type === "input_json_delta") {
+              enqueueChunk({
+                id: messageId,
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000),
+                model,
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      tool_calls: [
+                        {
+                          index: 0,
+                          ...(currentToolCall?.id ? { id: currentToolCall.id } : {}),
+                          type: "function",
+                          function: {
+                            ...(currentToolCall?.name ? { name: currentToolCall.name } : {}),
+                            arguments: delta.partial_json || "",
+                          },
+                        },
+                      ],
+                    },
+                    finish_reason: null,
+                  },
+                ],
+              });
+            } else if (delta?.type === "thinking_delta") {
+              enqueueChunk({
+                id: messageId,
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000),
+                model,
+                choices: [
+                  {
+                    index: 0,
+                    delta: { thinking: { content: delta.thinking || "" } },
+                    finish_reason: null,
+                  },
+                ],
+              });
+            }
+            return;
+          }
+
+          if (event.type === "message_delta") {
+            writeCacheUsageDebug(context?.req?.id, event.usage || {}, {
+              source: "anthropic_sse_message_delta",
+              stopReason: event.delta?.stop_reason,
+            });
+            inputTokens =
+              event.usage?.input_tokens ??
+              event.usage?.cache_creation_input_tokens ??
+              inputTokens;
+            outputTokens = event.usage?.output_tokens ?? outputTokens;
+            const cachedTokens = event.usage?.cache_read_input_tokens || 0;
+            enqueueChunk({
+              id: messageId,
+              object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000),
+              model,
+              choices: [
+                {
+                  index: 0,
+                  delta: {},
+                  finish_reason:
+                    finishReasonMapping[event.delta?.stop_reason] || "stop",
+                },
+              ],
+              usage: {
+                prompt_tokens: inputTokens,
+                completion_tokens: outputTokens,
+                total_tokens: inputTokens + outputTokens,
+                prompt_tokens_details: {
+                  cached_tokens: cachedTokens,
+                },
+              },
+            });
+            return;
+          }
+
+          if (event.type === "message_stop") {
+            finish();
+          }
+        };
+
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split(/\r?\n/);
+            buffer = lines.pop() || "";
+
+            for (const line of lines) {
+              if (!line.startsWith("data:")) continue;
+              const data = line.slice(5).trim();
+              if (!data || data === "[DONE]") continue;
+              try {
+                handleEvent(JSON.parse(data));
+              } catch (error) {
+                this.logger?.debug?.({
+                  reqId: context?.req?.id,
+                  error: error instanceof Error ? error.message : String(error),
+                  data,
+                }, "Failed to parse Anthropic stream event");
+              }
+            }
+          }
+          finish();
+        } catch (error) {
+          controller.error(error);
+        } finally {
+          try {
+            reader.releaseLock();
+          } catch {}
+          controller.close();
+        }
+      },
+    });
   }
 
   private convertOpenAIResponseToAnthropic(

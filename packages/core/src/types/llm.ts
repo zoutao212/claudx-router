@@ -214,6 +214,29 @@ export interface LLMProvider {
   models: ModelEntry[];
   /** Maximum concurrent requests allowed to this provider. Default: Infinity (no limit) */
   maxConcurrency?: number;
+  /** Provider-level options for fine-tuning behavior */
+  options?: {
+    /** Whether to place cache_control breakpoints on message content blocks.
+     *  Some proxies (e.g. opeapi.cn) ignore message-level cache_control.
+     *  Set to false (default) to skip message breakpoints for consistent cache prefixes.
+     *  Set to true when connecting directly to Anthropic API which supports them. */
+    cacheMessagesBreakpoint?: boolean;
+    /** Provider-level tool allow list. If set, only these tool/function names are sent upstream.
+     *  Useful for providers/proxies that do not cache tools and would otherwise charge
+     *  large tool schemas as normal input every request. */
+    toolAllowList?: string[];
+    /** Alias of toolAllowList for config readability. */
+    allowedTools?: string[];
+    /** Dynamically choose a smaller tool subset based on the current request text.
+     *  This preserves tool availability for common workflows while avoiding full tool
+     *  schema cost on providers/proxies that do not cache tools. */
+    autoToolFilter?: boolean;
+    /** Insert a tiny synthetic assistant/user seed turn on first hoisted request.
+     *  Some proxies do not create cache for a single-message first request, but do
+     *  create cache once the request has a multi-turn message shape. */
+    cacheWarmupFirstTurn?: boolean;
+    [key: string]: any;
+  };
   transformer?: {
     [key: string]: {
       use?: Transformer[];

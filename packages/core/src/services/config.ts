@@ -60,6 +60,12 @@ export class ConfigService {
     if (this.config.LOG) {
       process.env.LOG = this.config.LOG;
     }
+    if (this.config.CACHE_DEBUG) {
+      process.env.CCR_CACHE_DEBUG = "1";
+    }
+    if (this.config.CACHE_MESSAGES_BREAKPOINT) {
+      process.env.CCR_CACHE_MESSAGES_BREAKPOINT = "1";
+    }
   }
 
   private loadJsonConfig(): void {
