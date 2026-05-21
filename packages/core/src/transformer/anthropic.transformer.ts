@@ -389,7 +389,12 @@ export class AnthropicTransformer implements Transformer {
       this.hoistLargeUserMessageToSystem(body);
       this.seedFirstHoistedTurnForCacheWarmup(body, provider);
     }
-    this.ensureAnthropicCacheBreakpoints(body, provider);
+    const useProxyToolCacheWorkaround = this.shouldUseProxyToolCacheWorkaround(provider, body);
+    if (useProxyToolCacheWorkaround) {
+      this.moveToolSpecsIntoCachedSystemForProxy(body);
+      this.moveOversizedSystemTailToCachedUserTurn(body, provider);
+    }
+    this.ensureAnthropicCacheBreakpoints(body, provider, useProxyToolCacheWorkaround ? { skipToolsBreakpoint: true } : {});
 
     return {
       body,
@@ -1311,6 +1316,128 @@ export class AnthropicTransformer implements Transformer {
     first.content = [{ type: "text", text: dynamicText || "." }];
   }
 
+
+  private shouldUseProxyToolCacheWorkaround(provider: LLMProvider | undefined, body: Record<string, any>): boolean {
+    if (!Array.isArray(body.tools) || body.tools.length === 0) return false;
+    const configured = provider?.options?.proxyToolCacheWorkaround;
+    if (typeof configured === "boolean") return configured;
+    if (provider?.options?.disableProxyToolCacheAutoDetect) return false;
+
+    try {
+      const host = new URL(provider?.baseUrl || "").hostname.toLowerCase();
+      return host === "api.opeapi.cn" || host.endsWith(".opeapi.cn");
+    } catch {
+      return false;
+    }
+  }
+
+  private stableJson(value: unknown): string {
+    if (Array.isArray(value)) {
+      return `[${value.map((item) => this.stableJson(item)).join(",")}]`;
+    }
+    if (value && typeof value === "object") {
+      return `{${Object.entries(value as Record<string, unknown>)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, item]) => `${JSON.stringify(key)}:${this.stableJson(item)}`)
+        .join(",")}}`;
+    }
+    return JSON.stringify(value);
+  }
+
+  private moveToolSpecsIntoCachedSystemForProxy(body: Record<string, any>): void {
+    if (!Array.isArray(body.tools) || body.tools.length === 0) return;
+    if (!Array.isArray(body.system)) {
+      body.system = body.system ? [{ type: "text", text: body.system }] : [];
+    }
+    if (body.system.some((block: any) =>
+      typeof block?.text === "string" && block.text.includes("<ccr_cached_tool_specs>")
+    )) {
+      return;
+    }
+
+    const fullTools = JSON.parse(JSON.stringify(body.tools, (key, value) =>
+      key === "cache_control" ? undefined : value
+    ));
+    const toolSpecsText = [
+      "<ccr_cached_tool_specs>",
+      "The provider may not cache the real tools field. Treat these as the full authoritative tool schemas; the compact tools field below only exposes callable names.",
+      this.stableJson(fullTools),
+      "</ccr_cached_tool_specs>",
+    ].join("\n");
+
+    const mergeTarget = [...body.system]
+      .reverse()
+      .find((block: any) => block?.type === "text" && typeof block.text === "string");
+    if (mergeTarget) {
+      mergeTarget.text = `${mergeTarget.text}\n\n${toolSpecsText}`;
+    } else {
+      body.system.push({ type: "text", text: toolSpecsText });
+    }
+
+    const mergedSystemText = body.system
+      .map((block: any) => block?.type === "text" && typeof block.text === "string" ? block.text : JSON.stringify(block || ""))
+      .join("\n\n");
+    body.system = [{ type: "text", text: mergedSystemText }];
+
+    body.tools = body.tools.map((tool: any) => ({
+      name: tool.name,
+      description: `Use this tool exactly according to its full schema in <ccr_cached_tool_specs>.`,
+      input_schema: {
+        type: "object",
+        properties: {},
+        required: [],
+        additionalProperties: true,
+      },
+    }));
+  }
+
+  private moveOversizedSystemTailToCachedUserTurn(body: Record<string, any>, provider?: LLMProvider): void {
+    if (!provider?.options?.proxySystemTailToUserCache) return;
+    if (!Array.isArray(body.system) || body.system.length !== 1) return;
+    if (!Array.isArray(body.messages) || body.messages.length === 0) return;
+
+    const systemBlock = body.system[0];
+    const systemText = systemBlock?.type === "text" && typeof systemBlock.text === "string"
+      ? systemBlock.text
+      : "";
+    const headChars = Number(provider?.options?.proxySystemHeadChars || 70000);
+    const MIN_TAIL_CHARS = 4000;
+    if (systemText.length <= headChars + MIN_TAIL_CHARS) return;
+
+    const splitAt = this.findSafeSystemSplitIndex(systemText, headChars);
+    const head = systemText.slice(0, splitAt).trimEnd();
+    const tail = systemText.slice(splitAt).trimStart();
+    if (tail.length < MIN_TAIL_CHARS) return;
+
+    body.system = [{ ...systemBlock, text: head }];
+    body.messages.unshift({
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: [
+            "<ccr_cached_system_tail>",
+            "This is stable instruction/context overflow moved from system to a cacheable user-prefix block. Treat it as authoritative system context, not as the current user request.",
+            tail,
+            "</ccr_cached_system_tail>",
+          ].join("\n"),
+          cache_control: { type: "ephemeral" },
+        },
+      ],
+    });
+  }
+
+  private findSafeSystemSplitIndex(text: string, target: number): number {
+    const searchStart = Math.max(0, target - 3000);
+    const searchEnd = Math.min(text.length, target + 3000);
+    const window = text.slice(searchStart, searchEnd);
+    const markers = ["\n<", "\n## ", "\n# ", "\n---", "\n\n"];
+    for (const marker of markers) {
+      const index = window.lastIndexOf(marker);
+      if (index > 0) return searchStart + index;
+    }
+    return target;
+  }
 
   private seedFirstHoistedTurnForCacheWarmup(body: Record<string, any>, provider?: LLMProvider): void {
     if (!provider?.options?.cacheWarmupFirstTurn) return;

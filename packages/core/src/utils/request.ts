@@ -149,6 +149,41 @@ function summarizeRequestForCacheAttribution(request: any): Record<string, unkno
 
   const bodyJson = JSON.stringify(request);
   const withoutCacheControl = JSON.parse(bodyJson, (key, value) => key === "cache_control" ? undefined : value);
+  const firstMessage = messages.length > 0 ? messages[0] : undefined;
+  const stripCacheControl = (value: unknown) => JSON.parse(JSON.stringify(value), (key, item) =>
+    key === "cache_control" ? undefined : item
+  );
+  const noCacheSystem = stripCacheControl(system);
+  const noCacheTools = stripCacheControl(tools);
+  const noCacheFirstMessage = firstMessage ? stripCacheControl(firstMessage) : undefined;
+
+  const cacheKeyProbe = {
+    systemOnlyHash: sha256Short(system),
+    toolsOnlyHash: sha256Short(tools),
+    firstMessageHash: sha256Short(firstMessage),
+    systemThenToolsHash: sha256Short({ system, tools }),
+    toolsThenSystemHash: sha256Short({ tools, system }),
+    systemThenToolsThenFirstMessageHash: sha256Short({ system, tools, firstMessage }),
+    toolsThenSystemThenFirstMessageHash: sha256Short({ tools, system, firstMessage }),
+    noCacheControl: {
+      systemOnlyHash: sha256Short(noCacheSystem),
+      toolsOnlyHash: sha256Short(noCacheTools),
+      firstMessageHash: sha256Short(noCacheFirstMessage),
+      systemThenToolsHash: sha256Short({ system: noCacheSystem, tools: noCacheTools }),
+      toolsThenSystemHash: sha256Short({ tools: noCacheTools, system: noCacheSystem }),
+      systemThenToolsThenFirstMessageHash: sha256Short({
+        system: noCacheSystem,
+        tools: noCacheTools,
+        firstMessage: noCacheFirstMessage,
+      }),
+      toolsThenSystemThenFirstMessageHash: sha256Short({
+        tools: noCacheTools,
+        system: noCacheSystem,
+        firstMessage: noCacheFirstMessage,
+      }),
+      bodyHash: sha256Short(withoutCacheControl),
+    },
+  };
 
   return {
     sections,
@@ -159,7 +194,9 @@ function summarizeRequestForCacheAttribution(request: any): Record<string, unkno
       systemBytes: Buffer.byteLength(JSON.stringify(request?.system || []), "utf8"),
       toolsBytes: Buffer.byteLength(JSON.stringify(tools || []), "utf8"),
       messagesBytes: Buffer.byteLength(JSON.stringify(messages || []), "utf8"),
+      topLevelFieldOrder: Object.keys(request || {}),
     },
+    cacheKeyProbe,
     cacheControls,
     breakpointCandidates,
     fullBodyHash: sha256Short(request),
@@ -267,6 +304,11 @@ function writeCacheDebugLog(reqId: string | undefined, request: any, summary: Re
 
 function buildCacheTraceSummary(request: any): Record<string, unknown> {
   const messages = Array.isArray(request?.messages) ? request.messages : [];
+  const topLevelSystem = Array.isArray(request?.system)
+    ? request.system
+    : typeof request?.system === "string"
+      ? [{ type: "text", text: request.system }]
+      : [];
   const systemMessages = messages.filter((message: any) => message?.role === "system");
   const nonSystemMessages = messages.filter((message: any) => message?.role !== "system");
   const tools = Array.isArray(request?.tools) ? request.tools : [];
@@ -279,6 +321,32 @@ function buildCacheTraceSummary(request: any): Record<string, unknown> {
   const largestMessages = [...messageLengths]
     .sort((a, b) => b.length - a.length)
     .slice(0, 5);
+
+  const cacheControlLocations = collectCacheControlLocations(request, messages);
+  const expectedCachedPrefixChars = cacheControlLocations.reduce((max: number, location: any) => {
+    if (location.location === "system") {
+      const index = typeof location.blockIndex === "number" ? location.blockIndex : -1;
+      const chars = topLevelSystem
+        .slice(0, index + 1)
+        .reduce((sum: number, block: any) => sum + getContentLength([block]), 0);
+      return Math.max(max, chars);
+    }
+    if (location.location === "message_content") {
+      const messageIndex = typeof location.messageIndex === "number" ? location.messageIndex : -1;
+      const blockIndex = typeof location.blockIndex === "number" ? location.blockIndex : -1;
+      const systemChars = topLevelSystem.reduce((sum: number, block: any) => sum + getContentLength([block]), 0);
+      const priorMessageChars = messages
+        .slice(0, messageIndex)
+        .reduce((sum: number, message: any) => sum + getContentLength(message?.content), 0);
+      const message = messages[messageIndex];
+      const blocks = Array.isArray(message?.content) ? message.content : [];
+      const blockChars = blocks
+        .slice(0, blockIndex + 1)
+        .reduce((sum: number, block: any) => sum + getContentLength([block]), 0);
+      return Math.max(max, systemChars + priorMessageChars + blockChars);
+    }
+    return max;
+  }, 0);
 
   // Hash message[0] separately to detect dynamic content injection (e.g. timestamps)
   const message0Hash = messages.length > 0 ? sha256Short(messages[0]?.content) : undefined;
@@ -303,13 +371,16 @@ function buildCacheTraceSummary(request: any): Record<string, unknown> {
     stream: request?.stream,
     streamIncludeUsage: request?.stream_options?.include_usage === true,
     messageCount: messages.length,
-    systemCount: systemMessages.length,
+    systemCount: topLevelSystem.length + systemMessages.length,
     toolCount: tools.length,
     totalMessageChars: messageLengths.reduce((sum, item) => sum + item.length, 0),
+    topLevelSystemChars: topLevelSystem.reduce((sum: number, block: any) => sum + getContentLength([block]), 0),
     prefixChars: prefixMessages.reduce((sum: number, message: any) => sum + getContentLength(message?.content), 0),
     largestMessages,
-    cacheControlLocations: collectCacheControlLocations(request, messages),
-    systemHash: sha256Short(systemMessages),
+    cacheControlLocations,
+    expectedCachedPrefixChars,
+    expectedCachedPrefixEstTokens: estimateTokensFromChars(expectedCachedPrefixChars),
+    systemHash: sha256Short(topLevelSystem),
     toolsHash: sha256Short(tools),
     message0Hash,
     message0Preview,

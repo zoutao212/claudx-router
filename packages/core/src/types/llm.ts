@@ -231,10 +231,17 @@ export interface LLMProvider {
      *  This preserves tool availability for common workflows while avoiding full tool
      *  schema cost on providers/proxies that do not cache tools. */
     autoToolFilter?: boolean;
-    /** Insert a tiny synthetic assistant/user seed turn on first hoisted request.
-     *  Some proxies do not create cache for a single-message first request, but do
-     *  create cache once the request has a multi-turn message shape. */
-    cacheWarmupFirstTurn?: boolean;
+    /** Insert full Anthropic tool specs into cached system blocks and send minimized wire tools.
+     *  This works around API proxies that accept /v1/messages but internally convert
+     *  through OpenAI/sub2api-style schemas and drop tools[].cache_control.
+     *  Defaults to auto-enable for known affected proxy hosts such as opeapi.cn. */
+    proxyToolCacheWorkaround?: boolean;
+    /** Move the tail of an oversized system block into a stable first user message with
+     *  cache_control. Experimental workaround for proxies that only cache the first
+     *  ~40k tokens of system but may cache later user-message prefixes. */
+    proxySystemTailToUserCache?: boolean;
+    /** Character budget kept in system before moving the tail to a cached user turn. */
+    proxySystemHeadChars?: number;
     [key: string]: any;
   };
   transformer?: {
