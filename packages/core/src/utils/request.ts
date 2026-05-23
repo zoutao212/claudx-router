@@ -471,11 +471,44 @@ function writePerRequestMessageAuditLog(reqId: string | undefined, request: any)
       };
     });
 
+    // Also sample the top-level system field (Anthropic format)
+    const systemSample = (() => {
+      const sys = request?.system;
+      if (typeof sys === "string") {
+        const preview = sys.length > 300 ? sys.slice(0, 300) + "..." : sys;
+        return { type: "string", length: sys.length, hash: sha256Short(sys), preview };
+      }
+      if (Array.isArray(sys)) {
+        return sys.slice(0, 3).map((block: any, index: number) => {
+          const text = typeof block?.text === "string" ? block.text : JSON.stringify(block || "");
+          const preview = text.length > 300 ? text.slice(0, 300) + "..." : text;
+          return {
+            index,
+            type: block?.type,
+            length: text.length,
+            hash: sha256Short(block),
+            hasCacheControl: !!block?.cache_control,
+            preview,
+          };
+        });
+      }
+      return undefined;
+    })();
+
     writeFileSync(filePath, JSON.stringify({
       ts: now.toISOString(),
       reqId,
       model: request?.model,
       messageCount: messages.length,
+      topLevelSystemPresent: request?.system != null,
+      topLevelSystemChars: (() => {
+        if (typeof request?.system === "string") return request.system.length;
+        if (Array.isArray(request?.system)) return request.system.reduce((sum: number, block: any) => {
+          return sum + (typeof block?.text === "string" ? block.text.length : JSON.stringify(block || "").length);
+        }, 0);
+        return 0;
+      })(),
+      systemSample,
       requestHash,
       injectionDiagnostics: collectInjectionDiagnostics(request),
       firstMessages,

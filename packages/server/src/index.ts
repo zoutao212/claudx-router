@@ -351,6 +351,15 @@ async function getServer(options: RunOptions = {}) {
       }
     }
   });
+  
+  // Soul Genome Auto Injection (after agents, before transformer)
+  serverInstance.addHook("preHandler", async (req: any, reply: any) => {
+    if (req.pathname.endsWith("/v1/messages") && req.body) {
+      const { applySoulGenomeInjection } = await import("./utils/soulGenomeInjector");
+      await applySoulGenomeInjection(req.body, req.log);
+    }
+  });
+  
   serverInstance.addHook("onRequest", async (request: any, reply: any) => {
     request.log.info({
       phase: "incoming_request",
