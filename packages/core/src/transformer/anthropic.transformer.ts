@@ -563,7 +563,30 @@ export class AnthropicTransformer implements Transformer {
           }
         };
 
-        const safeClose = () => {
+        const maybeDelayForPromptCachePropagation = async () => {
+          const usage = stopReasonMessageDelta?.usage;
+          const stopReason = stopReasonMessageDelta?.delta?.stop_reason;
+          const cacheCreated = Number(usage?.cache_creation_input_tokens || 0);
+          const cacheRead = Number(usage?.cache_read_input_tokens || 0);
+          const threshold = Number(process.env.CCR_CACHE_PROPAGATION_DELAY_THRESHOLD || "20000");
+          const delayMs = Number(process.env.CCR_CACHE_PROPAGATION_DELAY_MS || "3000");
+          if (stopReason !== "tool_use" || cacheRead > 0 || cacheCreated < threshold || delayMs <= 0) {
+            return;
+          }
+          this.logger?.info?.(
+            {
+              reqId: context.req.id,
+              cacheCreated,
+              cacheRead,
+              delayMs,
+              stopReason,
+            },
+            "delaying tool-use stream close for prompt cache propagation"
+          );
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        };
+
+        const safeClose = async () => {
           if (!isClosed) {
             try {
               // Close any remaining open content block
@@ -582,6 +605,7 @@ export class AnthropicTransformer implements Transformer {
                 currentContentBlockIndex = -1;
               }
 
+              await maybeDelayForPromptCachePropagation();
               if (stopReasonMessageDelta) {
                 safeEnqueue(
                   encoder.encode(
@@ -1192,7 +1216,7 @@ export class AnthropicTransformer implements Transformer {
               }
             }
           }
-          safeClose();
+          await safeClose();
         } catch (error) {
           if (!isClosed) {
             try {
@@ -1736,14 +1760,38 @@ export class AnthropicTransformer implements Transformer {
         let inputTokens = 0;
         let outputTokens = 0;
         let finished = false;
+        let lastAnthropicUsage: Record<string, any> | null = null;
+        let lastAnthropicStopReason: string | null = null;
+
+        const maybeDelayForPromptCachePropagation = async () => {
+          const cacheCreated = Number(lastAnthropicUsage?.cache_creation_input_tokens || 0);
+          const cacheRead = Number(lastAnthropicUsage?.cache_read_input_tokens || 0);
+          const threshold = Number(process.env.CCR_CACHE_PROPAGATION_DELAY_THRESHOLD || "20000");
+          const delayMs = Number(process.env.CCR_CACHE_PROPAGATION_DELAY_MS || "3000");
+          if (lastAnthropicStopReason !== "tool_use" || cacheRead > 0 || cacheCreated < threshold || delayMs <= 0) {
+            return;
+          }
+          this.logger?.info?.(
+            {
+              reqId: context.req.id,
+              cacheCreated,
+              cacheRead,
+              delayMs,
+              stopReason: lastAnthropicStopReason,
+            },
+            "delaying OpenAI stream finish for prompt cache propagation"
+          );
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        };
 
         const enqueueChunk = (chunk: any) => {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
         };
 
-        const finish = () => {
+        const finish = async () => {
           if (finished) return;
           finished = true;
+          await maybeDelayForPromptCachePropagation();
           controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         };
 
@@ -1754,7 +1802,7 @@ export class AnthropicTransformer implements Transformer {
           stop_sequence: "stop",
         };
 
-        const handleEvent = (event: any) => {
+        const handleEvent = async (event: any) => {
           if (event?.error) {
             enqueueChunk({ error: event.error });
             return;
@@ -1882,6 +1930,8 @@ export class AnthropicTransformer implements Transformer {
           }
 
           if (event.type === "message_delta") {
+            lastAnthropicUsage = event.usage || null;
+            lastAnthropicStopReason = event.delta?.stop_reason || null;
             writeCacheUsageDebug(context?.req?.id, event.usage || {}, {
               source: "anthropic_sse_message_delta",
               stopReason: event.delta?.stop_reason,
@@ -1918,7 +1968,7 @@ export class AnthropicTransformer implements Transformer {
           }
 
           if (event.type === "message_stop") {
-            finish();
+            await finish();
           }
         };
 
@@ -1935,7 +1985,7 @@ export class AnthropicTransformer implements Transformer {
               const data = line.slice(5).trim();
               if (!data || data === "[DONE]") continue;
               try {
-                handleEvent(JSON.parse(data));
+                await handleEvent(JSON.parse(data));
               } catch (error) {
                 this.logger?.debug?.({
                   reqId: context?.req?.id,
@@ -1945,7 +1995,7 @@ export class AnthropicTransformer implements Transformer {
               }
             }
           }
-          finish();
+          await finish();
         } catch (error) {
           controller.error(error);
         } finally {
