@@ -50,6 +50,7 @@ echo   - Config API: http://127.0.0.1:8082/api/config
 echo   - Config: C:\Users\zouta\.claude-code-router\config.json
 echo.
 echo Trace logging enabled: CCR_TRACE=1
+echo History diff audit enabled: CCR_HISTORY_DIFF_AUDIT=1
 echo Trace logs will be written to: logs\trace\YYYY-MM-DD.jsonl
 echo.
 echo Press Ctrl+C to stop the server
@@ -57,6 +58,7 @@ echo ========================================
 echo.
 
 set CCR_TRACE=1
+set CCR_HISTORY_DIFF_AUDIT=1
 set SERVICE_PORT=8082
 set CCR_UPSTREAM_RETRY_TOTAL_MS=15000
 set CCR_UPSTREAM_RETRY_MAX=5

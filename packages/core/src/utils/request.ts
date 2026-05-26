@@ -9,6 +9,8 @@ let lastRequestBodySha256: string | null = null;
 let lastRequestBodySha256AtMs = 0;
 
 const cacheDebugRequestSummaries = new Map<string, Record<string, unknown>>();
+const historyDiffLastRequests = new Map<string, any>();
+
 
 function stableStringify(value: unknown): string {
   if (Array.isArray(value)) {
@@ -415,7 +417,169 @@ function collectInjectionDiagnostics(request: any): Record<string, unknown> {
   return { markerPresence };
 }
 
+function getHistoryDiffAuditLogPath(): string {
+  const dir = getMessageAuditLogDir();
+  const date = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  return join(dir, `history-diff-audit-${date}.jsonl`);
+}
+
+function getRequestPath(context: any, requestUrl: string): string | undefined {
+  const reqUrl = context?.req?.url;
+  if (typeof reqUrl === "string") return reqUrl;
+  try {
+    return new URL(requestUrl).pathname;
+  } catch {
+    return undefined;
+  }
+}
+
+function getMessageSignature(message: any): Record<string, unknown> {
+  return {
+    role: message?.role,
+    contentLength: getContentLength(message?.content),
+    contentHash: sha256Short(message?.content),
+    toolCallId: message?.tool_call_id,
+    toolCallsHash: message?.tool_calls ? sha256Short(message.tool_calls) : undefined,
+  };
+}
+
+function getCommonPrefixMessageCount(left: any[], right: any[]): number {
+  let index = 0;
+  while (index < left.length && index < right.length) {
+    if (sha256Short(left[index]) !== sha256Short(right[index])) break;
+    index++;
+  }
+  return index;
+}
+
+function getTailSource(message: any, index: number, inboundMessages: any[]): string {
+  const messageHash = sha256Short(message);
+  if (index < inboundMessages.length && sha256Short(inboundMessages[index]) === messageHash) {
+    return "presentInInboundSameIndex";
+  }
+  if (inboundMessages.some((inboundMessage: any) => sha256Short(inboundMessage) === messageHash)) {
+    return "presentInInboundAnyIndex";
+  }
+  return "createdOrChangedByCcr";
+}
+
+function summarizeTailMessages(messages: any[], startIndex: number, inboundMessages: any[] = []): Array<Record<string, unknown>> {
+  return messages.slice(startIndex).map((message: any, offset: number) => {
+    const index = startIndex + offset;
+    return {
+      index,
+      ...getMessageSignature(message),
+      tailSource: getTailSource(message, index, inboundMessages),
+      preview: sanitizeLogPreview(extractMessageText(message?.content).slice(0, 160)),
+    };
+  });
+}
+
+
+function collectHistoryAnomalies(messages: any[]): Record<string, unknown> {
+  const emptyAssistantMessages = messages
+    .map((message: any, index: number) => ({ message, index }))
+    .filter(({ message }) => message?.role === "assistant" && getContentLength(message?.content) === 0 && !message?.tool_calls?.length)
+    .map(({ index, message }) => ({ index, contentHash: sha256Short(message?.content) }));
+
+  const toolContentGroups = new Map<string, { count: number; indexes: number[]; length: number }>();
+  messages.forEach((message: any, index: number) => {
+    if (message?.role !== "tool") return;
+    const hash = sha256Short(message.content);
+    const current = toolContentGroups.get(hash) || { count: 0, indexes: [], length: getContentLength(message.content) };
+    current.count++;
+    current.indexes.push(index);
+    toolContentGroups.set(hash, current);
+  });
+
+  const repeatedToolContentHashes = [...toolContentGroups.entries()]
+    .filter(([, group]) => group.count > 1)
+    .map(([contentHash, group]) => ({ contentHash, ...group }));
+
+  return { emptyAssistantMessages, repeatedToolContentHashes };
+}
+
+function getInboundFinalFirstDiff(inboundMessages: any[], finalMessages: any[]): Record<string, unknown> | undefined {
+  const maxLength = Math.max(inboundMessages.length, finalMessages.length);
+  for (let index = 0; index < maxLength; index++) {
+    const inbound = inboundMessages[index];
+    const final = finalMessages[index];
+    if (sha256Short(inbound) === sha256Short(final)) continue;
+    return {
+      index,
+      inbound: inbound === undefined ? undefined : getMessageSignature(inbound),
+      final: final === undefined ? undefined : getMessageSignature(final),
+    };
+  }
+  return undefined;
+}
+
+function determineHistorySource(inboundMessages: any[], finalMessages: any[]): Record<string, unknown> {
+  const commonPrefixMessages = getCommonPrefixMessageCount(inboundMessages, finalMessages);
+  const inboundHash = sha256Short(inboundMessages);
+  const finalHash = sha256Short(finalMessages);
+
+  return {
+    source: inboundHash === finalHash ? "client" : "ccr",
+    commonPrefixMessages,
+    firstDiff: getInboundFinalFirstDiff(inboundMessages, finalMessages),
+    inboundMessageCount: inboundMessages.length,
+    finalMessageCount: finalMessages.length,
+    inboundMessagesHash: inboundHash,
+    finalMessagesHash: finalHash,
+  };
+}
+
+
+function writeHistoryDiffAuditLog(
+  reqId: string | undefined,
+  request: any,
+  context: any,
+  requestUrl: string,
+): void {
+  if (!isEnvEnabled("CCR_HISTORY_DIFF_AUDIT")) return;
+  try {
+    const messages = Array.isArray(request?.messages) ? request.messages : [];
+    const inboundMessages = Array.isArray(context?.req?.body?.messages) ? context.req.body.messages : [];
+    const requestPath = getRequestPath(context, requestUrl);
+    const key = `${request?.model || "unknown"}:${requestPath || "unknown"}`;
+    const previous = historyDiffLastRequests.get(key);
+    const previousMessages = Array.isArray(previous?.messages) ? previous.messages : [];
+    const commonPrefixMessages = previous ? getCommonPrefixMessageCount(previousMessages, messages) : 0;
+
+    appendFileSync(getHistoryDiffAuditLogPath(), JSON.stringify({
+      ts: new Date().toISOString(),
+      kind: "history_diff_audit",
+      reqId,
+      model: request?.model,
+      requestPath,
+      current: {
+        messageCount: messages.length,
+        messagesHash: sha256Short(messages),
+        totalMessageChars: messages.reduce((sum: number, message: any) => sum + getContentLength(message?.content), 0),
+      },
+      previousFinalDiff: {
+        previousReqId: previous?.reqId,
+        previousMessageCount: previousMessages.length,
+        commonPrefixMessages,
+        commonPrefixChars: messages.slice(0, commonPrefixMessages).reduce((sum: number, message: any) => sum + getContentLength(message?.content), 0),
+        appendedTail: summarizeTailMessages(messages, commonPrefixMessages, inboundMessages),
+      },
+      inboundVsFinal: determineHistorySource(inboundMessages, messages),
+      anomalies: collectHistoryAnomalies(messages),
+    }) + "\n", "utf-8");
+
+    historyDiffLastRequests.set(key, {
+      reqId,
+      messages: cloneJson(messages),
+    });
+  } catch {
+    // Silently ignore audit log errors.
+  }
+}
+
 function writeFullFinalRequestAuditLog(
+
   reqId: string | undefined,
   request: any,
   bodyJson: string,
@@ -728,7 +892,9 @@ export function sendUnifiedRequest(
   });
 
   const cacheTraceSummary = buildCacheTraceSummary(finalRequest);
+  const requestUrl = typeof url === "string" ? url : url.toString();
   writePerRequestMessageAuditLog(context?.req?.id, finalRequest);
+  writeHistoryDiffAuditLog(context?.req?.id, finalRequest, context, requestUrl);
 
   // CACHE_DEBUG: write detailed request body analysis to a separate log file
   if (process.env.CCR_CACHE_DEBUG === "1") {
@@ -738,7 +904,7 @@ export function sendUnifiedRequest(
   logger?.info?.(
     {
       reqId: context?.req?.id,
-      requestUrl: typeof url === "string" ? url : url.toString(),
+      requestUrl,
       cacheTraceSummary,
     },
     "upstream cache trace"
@@ -747,7 +913,8 @@ export function sendUnifiedRequest(
   traceLog({
     phase: "upstream_request",
     reqId: context?.req?.id,
-    requestUrl: typeof url === "string" ? url : url.toString(),
+    requestUrl,
+
     method: fetchOptions.method,
     headers: redactHeaders(headerObject),
     body: finalRequest,

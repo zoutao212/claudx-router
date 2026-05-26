@@ -268,170 +268,127 @@ export function convertFromAnthropic(
       content: request.system,
     });
   }
-  const pendingToolCalls: any[] = [];
-  const pendingTextContent: string[] = [];
-  let lastRole: string | null = null;
 
-  for (let i = 0; i < request.messages.length; i++) {
-    const msg = request.messages[i];
+  let pendingAssistantText: string[] = [];
+  let pendingAssistantToolCalls: any[] = [];
 
+  const flushPendingAssistant = () => {
+    if (pendingAssistantText.length === 0 && pendingAssistantToolCalls.length === 0) {
+      return;
+    }
+
+    messages.push({
+      role: "assistant",
+      content: pendingAssistantText.length > 0 ? pendingAssistantText.join("") : null,
+      ...(pendingAssistantToolCalls.length > 0
+        ? { tool_calls: [...pendingAssistantToolCalls] }
+        : {}),
+    });
+
+    pendingAssistantText = [];
+    pendingAssistantToolCalls = [];
+  };
+
+  const normalizeToolResultContent = (content: any): string => {
+    if (typeof content === "string") return content;
+    if (Array.isArray(content)) {
+      return content
+        .map((item) => {
+          if (typeof item === "string") return item;
+          if (item?.type === "text" && typeof item.text === "string") {
+            return item.text;
+          }
+          if (typeof item?.content === "string") {
+            return item.content;
+          }
+          return JSON.stringify(item ?? "");
+        })
+        .join("\n");
+    }
+    return JSON.stringify(content ?? "");
+  };
+
+  for (const msg of request.messages) {
     if (typeof msg.content === "string") {
-      if (
-        lastRole === "assistant" &&
-        pendingToolCalls.length > 0 &&
-        msg.role !== "assistant"
-      ) {
-        const assistantMessage: UnifiedMessage = {
-          role: "assistant",
-          content: pendingTextContent.join("") || null,
-          tool_calls:
-            pendingToolCalls.length > 0 ? pendingToolCalls : undefined,
-        };
-        if (assistantMessage.tool_calls && pendingTextContent.length === 0) {
-          assistantMessage.content = null;
-        }
-        messages.push(assistantMessage);
-        pendingToolCalls.length = 0;
-        pendingTextContent.length = 0;
+      if (msg.role !== "assistant") {
+        flushPendingAssistant();
       }
 
-      messages.push({
-        role: msg.role,
-        content: msg.content,
-      });
-    } else if (Array.isArray(msg.content)) {
-      const textBlocks: string[] = [];
-      const toolCalls: any[] = [];
-      const toolResults: any[] = [];
+      if (msg.role === "assistant") {
+        pendingAssistantText.push(msg.content);
+      } else {
+        messages.push({
+          role: msg.role,
+          content: msg.content,
+        });
+      }
+      continue;
+    }
 
-      msg.content.forEach((block) => {
-        if (block.type === "text") {
-          textBlocks.push(block.text);
-        } else if (block.type === "tool_use") {
-          toolCalls.push({
-            id: block.id,
-            type: "function" as const,
-            function: {
-              name: block.name,
-              arguments: JSON.stringify(block.input || {}),
-            },
-          });
-        } else if (block.type === "tool_result") {
-          toolResults.push(block);
+    if (Array.isArray(msg.content)) {
+      const textBlocks = msg.content
+        .filter((block) => block?.type === "text" && typeof block.text === "string")
+        .map((block) => block.text);
+      const toolCalls = msg.content
+        .filter((block) => block?.type === "tool_use" && block.id)
+        .map((block) => ({
+          id: block.id,
+          type: "function" as const,
+          function: {
+            name: block.name,
+            arguments: JSON.stringify(block.input || {}),
+          },
+        }));
+      const toolResults = msg.content.filter((block) => block?.type === "tool_result");
+
+      if (msg.role === "assistant") {
+        if (toolResults.length > 0) {
+          flushPendingAssistant();
+          for (const toolResult of toolResults) {
+            messages.push({
+              role: "tool",
+              content: normalizeToolResultContent(toolResult.content),
+              tool_call_id: toolResult.tool_use_id,
+            });
+          }
+          continue;
         }
-      });
+
+        pendingAssistantText.push(...textBlocks);
+        pendingAssistantToolCalls.push(...toolCalls);
+        continue;
+      }
+
+      flushPendingAssistant();
 
       if (toolResults.length > 0) {
-        if (lastRole === "assistant" && pendingToolCalls.length > 0) {
-          const assistantMessage: UnifiedMessage = {
-            role: "assistant",
-            content: pendingTextContent.join("") || null,
-            tool_calls: pendingToolCalls,
-          };
-          if (pendingTextContent.length === 0) {
-            assistantMessage.content = null;
-          }
-          messages.push(assistantMessage);
-          pendingToolCalls.length = 0;
-          pendingTextContent.length = 0;
-        }
-
-        toolResults.forEach((toolResult) => {
+        for (const toolResult of toolResults) {
           messages.push({
             role: "tool",
-            content:
-              typeof toolResult.content === "string"
-                ? toolResult.content
-                : JSON.stringify(toolResult.content),
+            content: normalizeToolResultContent(toolResult.content),
             tool_call_id: toolResult.tool_use_id,
           });
-        });
-      } else if (msg.role === "assistant") {
-        if (lastRole === "assistant") {
-          pendingToolCalls.push(...toolCalls);
-          pendingTextContent.push(...textBlocks);
-        } else {
-          if (pendingToolCalls.length > 0) {
-            const prevAssistantMessage: UnifiedMessage = {
-              role: "assistant",
-              content: pendingTextContent.join("") || null,
-              tool_calls: pendingToolCalls,
-            };
-            if (pendingTextContent.length === 0) {
-              prevAssistantMessage.content = null;
-            }
-            messages.push(prevAssistantMessage);
-          }
-
-          pendingToolCalls.length = 0;
-          pendingTextContent.length = 0;
-          pendingToolCalls.push(...toolCalls);
-          pendingTextContent.push(...textBlocks);
         }
-      } else {
-        if (lastRole === "assistant" && pendingToolCalls.length > 0) {
-          const assistantMessage: UnifiedMessage = {
-            role: "assistant",
-            content: pendingTextContent.join("") || null,
-            tool_calls: pendingToolCalls,
-          };
-          if (pendingTextContent.length === 0) {
-            assistantMessage.content = null;
-          }
-          messages.push(assistantMessage);
-          pendingToolCalls.length = 0;
-          pendingTextContent.length = 0;
-        }
+      }
 
-        const message: UnifiedMessage = {
+      if (textBlocks.length > 0 || toolCalls.length > 0) {
+        messages.push({
           role: msg.role,
-          content: textBlocks.join("") || null,
-        };
-
-        if (toolCalls.length > 0) {
-          message.tool_calls = toolCalls;
-          if (textBlocks.length === 0) {
-            message.content = null;
-          }
-        }
-
-        messages.push(message);
+          content: textBlocks.length > 0 ? textBlocks.join("") : null,
+          ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+        });
       }
-    } else {
-      if (lastRole === "assistant" && pendingToolCalls.length > 0) {
-        const assistantMessage: UnifiedMessage = {
-          role: "assistant",
-          content: pendingTextContent.join("") || null,
-          tool_calls: pendingToolCalls,
-        };
-        if (pendingTextContent.length === 0) {
-          assistantMessage.content = null;
-        }
-        messages.push(assistantMessage);
-        pendingToolCalls.length = 0;
-        pendingTextContent.length = 0;
-      }
-
-      messages.push({
-        role: msg.role,
-        content: JSON.stringify(msg.content),
-      });
+      continue;
     }
 
-    lastRole = msg.role;
+    flushPendingAssistant();
+    messages.push({
+      role: msg.role,
+      content: JSON.stringify(msg.content),
+    });
   }
 
-  if (lastRole === "assistant" && pendingToolCalls.length > 0) {
-    const assistantMessage: UnifiedMessage = {
-      role: "assistant",
-      content: pendingTextContent.join("") || null,
-      tool_calls: pendingToolCalls,
-    };
-    if (pendingTextContent.length === 0) {
-      assistantMessage.content = null;
-    }
-    messages.push(assistantMessage);
-  }
+  flushPendingAssistant();
 
   const result: UnifiedChatRequest = {
     messages,
@@ -455,6 +412,7 @@ export function convertFromAnthropic(
 
   return result;
 }
+
 
 export function convertRequest(
   request: OpenAIChatRequest | AnthropicChatRequest | UnifiedChatRequest,

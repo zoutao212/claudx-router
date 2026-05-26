@@ -353,10 +353,15 @@ async function getServer(options: RunOptions = {}) {
   });
   
   // Soul Genome Auto Injection (after agents, before transformer)
+  // 支持所有端点：/v1/messages (Anthropic), /v1/chat/completions (OpenAI), /v1/responses (OpenAI Responses)
   serverInstance.addHook("preHandler", async (req: any, reply: any) => {
-    if (req.pathname.endsWith("/v1/messages") && req.body) {
+    const pn = req.pathname || "";
+    const isChatEndpoint = pn.endsWith("/v1/messages") ||
+      pn.endsWith("/v1/chat/completions") ||
+      pn.endsWith("/v1/responses");
+    if (isChatEndpoint && req.body) {
       const { applySoulGenomeInjection } = await import("./utils/soulGenomeInjector");
-      await applySoulGenomeInjection(req.body, req.log);
+      await applySoulGenomeInjection(req.body, req.log, pn);
     }
   });
   

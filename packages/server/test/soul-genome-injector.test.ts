@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { applySoulGenomeInjectionForTest } from "../src/utils/soulGenomeInjector";
 
 (async () => {
-  const requestBody = {
+  // ===== Test 1: OpenAI 格式注入 (原始测试) =====
+  const requestBody1 = {
     model: "gpt-5.4",
     messages: [
       { role: "system", content: "base system prompt" },
@@ -11,7 +12,7 @@ import { applySoulGenomeInjectionForTest } from "../src/utils/soulGenomeInjector
   };
 
   const logs: Array<Record<string, unknown>> = [];
-  const result = await applySoulGenomeInjectionForTest(requestBody, {
+  const result1 = await applySoulGenomeInjectionForTest(requestBody1, {
     enabled: true,
     tokenBudget: 1200,
     memoryTopK: 3,
@@ -26,23 +27,72 @@ import { applySoulGenomeInjectionForTest } from "../src/utils/soulGenomeInjector
     log: (record) => logs.push(record),
   });
 
-  assert.equal(result.injected, true);
-  assert.equal(requestBody.messages.length, 3);
-  assert.equal(requestBody.messages[1].role, "system");
-  assert.ok(String(requestBody.messages[1].content).includes("[CCR Soul Genome Auto Injection]"));
-  assert.ok(String(requestBody.messages[1].content).includes("自动注入文本"));
-  assert.equal(requestBody.messages[2].content, "帮我排查 CodeBuddy hook 没执行，想让 CCR 自动注入 soul-genome");
+  assert.equal(result1.injected, true);
+  assert.equal(requestBody1.messages.length, 3);
+  assert.equal(requestBody1.messages[1].role, "system");
+  assert.ok(String(requestBody1.messages[1].content).includes("[CCR Soul Genome Auto Injection]"));
+  assert.ok(String(requestBody1.messages[1].content).includes("自动注入文本"));
+  assert.equal(requestBody1.messages[2].content, "帮我排查 CodeBuddy hook 没执行，想让 CCR 自动注入 soul-genome");
   assert.equal(logs.some((record) => record.phase === "soul_genome_inject" && record.injected === true), true);
 
-  const second = await applySoulGenomeInjectionForTest(requestBody, {
+  // ===== Test 2: 重复注入防护 =====
+  const second = await applySoulGenomeInjectionForTest(requestBody1, {
     enabled: true,
     callSoulInject: async () => "duplicate should not be added",
     log: (record) => logs.push(record),
   });
 
   assert.equal(second.injected, false);
-  assert.equal(requestBody.messages.length, 3);
+  assert.equal(requestBody1.messages.length, 3);
 
-  console.log("soul genome injector behavior ok");
+  console.log("Test 1 & 2: OpenAI format injection ok");
+
+  // ===== Test 3: 无 system 角色消息的 OpenAI 格式（unshift 到开头） =====
+  const requestBody3 = {
+    model: "glm-5.1",
+    messages: [
+      { role: "user", content: "hello world" },
+    ],
+  };
+
+  const result3 = await applySoulGenomeInjectionForTest(requestBody3, {
+    enabled: true,
+    callSoulInject: async () => "injected at head",
+    log: () => {},
+  });
+
+  assert.equal(result3.injected, true);
+  assert.equal(requestBody3.messages[0].role, "system");
+  assert.ok(String(requestBody3.messages[0].content).includes("[CCR Soul Genome Auto Injection]"));
+
+  console.log("Test 3: OpenAI format (no prior system) injection ok");
+
+  // ===== Test 4: 无 enabled 配置 =====
+  const result4 = await applySoulGenomeInjectionForTest({ messages: [{ role: "user", content: "x" }] }, {
+    enabled: false,
+    callSoulInject: async () => "should not be called",
+    log: () => {},
+  });
+
+  assert.equal(result4.injected, false);
+  assert.equal(result4.reason, "disabled");
+
+  console.log("Test 4: disabled config ok");
+
+  // ===== Test 5: 空用户消息 =====
+  const result5 = await applySoulGenomeInjectionForTest({
+    model: "test",
+    messages: [{ role: "user", content: "   " }],
+  }, {
+    enabled: true,
+    callSoulInject: async () => "should not be called",
+    log: () => {},
+  });
+
+  assert.equal(result5.injected, false);
+  assert.equal(result5.reason, "empty_user_input");
+
+  console.log("Test 5: empty user input ok");
+
+  console.log("all soul genome injector tests passed");
 })();
-

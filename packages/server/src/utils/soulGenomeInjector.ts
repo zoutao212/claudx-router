@@ -137,9 +137,97 @@ async function callSoulInject(userInput: string, context: string, tokenBudget: n
   throw new Error("Invalid soul_inject response");
 }
 
+const CCR_SOUL_MARKER = "[CCR Soul Genome Auto Injection]";
+
+/**
+ * 检查是否已有 CCR 灵魂注入标记（同时检查 messages 和顶层 system 字段）
+ */
+function isAlreadyInjected(requestBody: any): boolean {
+  const messages = requestBody?.messages;
+  if (Array.isArray(messages)) {
+    const found = messages.some((msg: any) =>
+      String(msg?.content || "").includes(CCR_SOUL_MARKER)
+    );
+    if (found) return true;
+  }
+
+  // Anthropic 格式：顶层 system 字段
+  const system = requestBody?.system;
+  if (typeof system === "string" && system.includes(CCR_SOUL_MARKER)) return true;
+  if (Array.isArray(system)) {
+    if (system.some((block: any) =>
+      String(block?.text || block?.content || "").includes(CCR_SOUL_MARKER)
+    )) return true;
+  }
+
+  return false;
+}
+
+/**
+ * 从请求体中提取最后一条用户消息文本
+ * 同时兼容 OpenAI 格式（messages 包含所有角色）和 Anthropic 格式（messages 只有 user/assistant）
+ */
+function extractLastUserInput(requestBody: any): string | null {
+  const messages = requestBody?.messages;
+  if (!Array.isArray(messages) || messages.length === 0) return null;
+
+  const lastUserMessage = messages.filter((msg: any) => msg?.role === "user").pop();
+  if (!lastUserMessage) return null;
+
+  const content = lastUserMessage.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((block: any) => block?.text || "").join(" ");
+  }
+  return null;
+}
+
+/**
+ * 将灵魂注入内容插入请求体
+ * - OpenAI 格式（/v1/chat/completions, /v1/responses）：插入 system role 消息到 messages 数组
+ * - Anthropic 格式（/v1/messages）：插入到顶层 system 字段
+ */
+function insertInjection(requestBody: any, soulText: string, pathname: string): void {
+  const isAnthropicEndpoint = pathname.endsWith("/v1/messages");
+
+  if (isAnthropicEndpoint && requestBody.system != null) {
+    // Anthropic 格式：注入到顶层 system 字段
+    const injectionBlock = {
+      type: "text",
+      text: `${CCR_SOUL_MARKER}\n\n${soulText}`,
+    };
+
+    if (Array.isArray(requestBody.system)) {
+      // 插到 system 数组末尾（最末位置，保持 cache_control 顺序）
+      requestBody.system.push(injectionBlock);
+    } else if (typeof requestBody.system === "string") {
+      // 字符串形式，转换为数组
+      requestBody.system = [
+        { type: "text", text: requestBody.system },
+        injectionBlock,
+      ];
+    }
+  } else {
+    // OpenAI 格式：注入 system role 消息到 messages
+    const injectionMessage = {
+      role: "system",
+      content: `${CCR_SOUL_MARKER}\n\n${soulText}`,
+    };
+
+    const messages = requestBody.messages;
+    const firstSystemIndex = messages.findIndex((msg: any) => msg?.role === "system");
+    if (firstSystemIndex >= 0) {
+      messages.splice(firstSystemIndex + 1, 0, injectionMessage);
+    } else {
+      messages.unshift(injectionMessage);
+    }
+  }
+}
+
 export async function applySoulGenomeInjection(
   requestBody: any,
-  logger?: any
+  logger?: any,
+  pathname?: string
 ): Promise<{ injected: boolean; reason?: string }> {
   const config = getSoulGenomeConfig();
   if (!config?.enabled) {
@@ -151,26 +239,13 @@ export async function applySoulGenomeInjection(
     return { injected: false, reason: "no_messages" };
   }
 
-  // 检查是否已注入
-  const alreadyInjected = messages.some((msg: any) =>
-    String(msg?.content || "").includes("[CCR Soul Genome Auto Injection]")
-  );
-  if (alreadyInjected) {
+  // 检查是否已注入（同时检查 messages 和顶层 system）
+  if (isAlreadyInjected(requestBody)) {
     return { injected: false, reason: "already_injected" };
   }
 
-  const lastUserMessage = messages.filter((msg: any) => msg?.role === "user").pop();
-  if (!lastUserMessage) {
-    return { injected: false, reason: "no_user_message" };
-  }
-
-  const userInput = typeof lastUserMessage.content === "string"
-    ? lastUserMessage.content
-    : Array.isArray(lastUserMessage.content)
-      ? lastUserMessage.content.map((block: any) => block?.text || "").join(" ")
-      : "";
-
-  if (!userInput.trim()) {
+  const userInput = extractLastUserInput(requestBody);
+  if (!userInput || !userInput.trim()) {
     return { injected: false, reason: "empty_user_input" };
   }
 
@@ -186,23 +261,14 @@ export async function applySoulGenomeInjection(
       config.memoryTopK || 5
     );
 
-    const injectionMessage = {
-      role: "system",
-      content: `[CCR Soul Genome Auto Injection]\n\n${soulText}`,
-    };
-
-    const firstSystemIndex = messages.findIndex((msg: any) => msg?.role === "system");
-    if (firstSystemIndex >= 0) {
-      messages.splice(firstSystemIndex + 1, 0, injectionMessage);
-    } else {
-      messages.unshift(injectionMessage);
-    }
+    insertInjection(requestBody, soulText, pathname || "");
 
     logger?.info?.({
       phase: "soul_genome_inject",
       injected: true,
       userInputLength: userInput.length,
       soulTextLength: soulText.length,
+      pathname,
     }, "soul genome injected");
 
     return { injected: true };
@@ -211,6 +277,7 @@ export async function applySoulGenomeInjection(
       phase: "soul_genome_inject",
       injected: false,
       error: error.message,
+      pathname,
     }, "soul genome injection failed");
 
     return { injected: false, reason: error.message };
