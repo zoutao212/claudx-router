@@ -183,14 +183,12 @@ export class ProviderService {
       transformerConfig.use = [apiTransformerName, ...currentUse];
     }
 
-    // Auto-add DeepseekTransformer for DeepSeek-related providers.
-    // DeepSeek's API requires reasoning_content to be passed back on assistant messages
-    // when thinking mode is active. The DeepseekTransformer handles this conversion
-    // (thinking back to reasoning_content on requests, and reasoning_content to thinking
-    // on responses). Match by provider name or base URL containing "deepseek" or
-    // "opencode.ai" (which proxies DeepSeek models).
+    // Auto-add DeepseekTransformer for DeepSeek-related OpenAI-compatible providers.
+    // Do not attach it to Anthropic providers: DeepseekTransformer expects OpenAI SSE
+    // (`data: { choices: ... }`) and will destroy Anthropic SSE frame boundaries
+    // (`event: ...\ndata: ...\n\n`), causing downstream Anthropic conversion to emit DONE only.
     const deepseekTransformerName = "deepseek";
-    if (this.transformerService.hasTransformer(deepseekTransformerName)) {
+    if (apiTransformerName !== "Anthropic" && this.transformerService.hasTransformer(deepseekTransformerName)) {
       const providerLower = providerConfig.name.toLowerCase();
       const baseUrlLower = (providerConfig.api_base_url || "").toLowerCase();
       if (

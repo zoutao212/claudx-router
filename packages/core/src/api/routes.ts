@@ -681,6 +681,64 @@ function pipeStreamToReply(stream: any, reply: FastifyReply): FastifyReply {
   return reply;
 }
 
+export function rewriteImageModelForProxy(
+  body: any,
+  modelMigrations: Record<string, string> = {}
+): any {
+  if (!body || typeof body !== "object") return body;
+  const rewritten = { ...body };
+  if (typeof rewritten.model === "string" && rewritten.model in modelMigrations) {
+    rewritten.model = modelMigrations[rewritten.model];
+  }
+  return rewritten;
+}
+
+function joinBaseUrlAndPath(baseUrl: string, path: string): string {
+  return `${baseUrl.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
+}
+
+async function handleOpenAIImageProxy(
+  req: FastifyRequest,
+  reply: FastifyReply,
+  fastify: FastifyInstance,
+  upstreamPath: "/images/generations" | "/images/edits"
+) {
+  const proxyConfig = fastify.configService.get<any>("OpenAIImageProxy");
+  const baseUrl = proxyConfig?.api_base_url || proxyConfig?.base_url;
+  const apiKey = proxyConfig?.api_key;
+
+  if (!baseUrl || !apiKey) {
+    throw createApiError("OpenAIImageProxy.api_base_url and api_key are required", 500, "image_proxy_not_configured");
+  }
+
+  const originalBody = req.body as any;
+  if (!originalBody || typeof originalBody !== "object") {
+    throw createApiError("OpenAI image proxy requires a JSON request body", 400, "invalid_image_request");
+  }
+
+  const requestBody = rewriteImageModelForProxy(originalBody, proxyConfig.model_migrations || {});
+  if (requestBody.model !== originalBody.model) {
+    req.log.info(`OpenAI image model migration: "${originalBody.model}" → "${requestBody.model}"`);
+  }
+
+  const upstreamUrl = joinBaseUrlAndPath(baseUrl, upstreamPath);
+  const response = await fetch(upstreamUrl, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(requestBody),
+  });
+
+  reply.code(response.status);
+  const contentType = response.headers.get("content-type");
+  if (contentType) reply.header("content-type", contentType);
+
+  const text = await response.text();
+  return reply.send(text);
+}
+
 export const registerApiRoutes = async (
   fastify: FastifyInstance
 ) => {
@@ -707,7 +765,22 @@ export const registerApiRoutes = async (
     }
   };
 
+  registerV1CompatiblePost(
+    "/v1/images/generations",
+    async (req: FastifyRequest, reply: FastifyReply) => {
+      return handleOpenAIImageProxy(req, reply, fastify, "/images/generations");
+    }
+  );
+
+  registerV1CompatiblePost(
+    "/v1/images/edits",
+    async (req: FastifyRequest, reply: FastifyReply) => {
+      return handleOpenAIImageProxy(req, reply, fastify, "/images/edits");
+    }
+  );
+
   // Add /v1/models endpoint for Claude Code model discovery
+
   registerV1CompatibleGet(
     "/v1/models",
     async (request: FastifyRequest, reply: FastifyReply) => {

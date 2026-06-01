@@ -1972,29 +1972,66 @@ export class AnthropicTransformer implements Transformer {
           }
         };
 
+        const processSseFrame = async (frame: string) => {
+          const dataLines: string[] = [];
+          let eventName = "";
+
+          for (const rawLine of frame.split(/\r?\n/)) {
+            if (!rawLine || rawLine.startsWith(":")) continue;
+            const separatorIndex = rawLine.indexOf(":");
+            const field = separatorIndex === -1 ? rawLine : rawLine.slice(0, separatorIndex);
+            let value = separatorIndex === -1 ? "" : rawLine.slice(separatorIndex + 1);
+            if (value.startsWith(" ")) value = value.slice(1);
+
+            if (field === "event") {
+              eventName = value;
+            } else if (field === "data") {
+              dataLines.push(value);
+            }
+          }
+
+          const data = dataLines.join("\n").trim();
+          if (!data || data === "[DONE]") return;
+
+          try {
+            const event = JSON.parse(data);
+            if (eventName && !event.type) event.type = eventName;
+            await handleEvent(event);
+          } catch (error) {
+            this.logger?.debug?.({
+              reqId: context?.req?.id,
+              event: eventName || undefined,
+              error: error instanceof Error ? error.message : String(error),
+              data,
+            }, "Failed to parse Anthropic stream event");
+          }
+        };
+
+        const processBufferedFrames = async (flush = false) => {
+          while (true) {
+            const separator = buffer.match(/\r?\n\r?\n/);
+            if (!separator?.index && separator?.index !== 0) break;
+            const frame = buffer.slice(0, separator.index);
+            buffer = buffer.slice(separator.index + separator[0].length);
+            await processSseFrame(frame);
+          }
+
+          if (flush && buffer.trim()) {
+            const frame = buffer;
+            buffer = "";
+            await processSseFrame(frame);
+          }
+        };
+
         try {
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
             buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split(/\r?\n/);
-            buffer = lines.pop() || "";
-
-            for (const line of lines) {
-              if (!line.startsWith("data:")) continue;
-              const data = line.slice(5).trim();
-              if (!data || data === "[DONE]") continue;
-              try {
-                await handleEvent(JSON.parse(data));
-              } catch (error) {
-                this.logger?.debug?.({
-                  reqId: context?.req?.id,
-                  error: error instanceof Error ? error.message : String(error),
-                  data,
-                }, "Failed to parse Anthropic stream event");
-              }
-            }
+            await processBufferedFrames();
           }
+          buffer += decoder.decode();
+          await processBufferedFrames(true);
           await finish();
         } catch (error) {
           controller.error(error);
