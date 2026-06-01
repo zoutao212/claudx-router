@@ -1,7 +1,17 @@
 import assert from "node:assert/strict";
-import { applySoulGenomeInjectionForTest } from "../src/utils/soulGenomeInjector";
+import { applySoulGenomeInjectionForTest, extractSoulInjectTextForTest } from "../src/utils/soulGenomeInjector";
 
 (async () => {
+  // ===== Test 0: 标准 MCP tools/call 包装返回解析 =====
+  assert.equal(
+    extractSoulInjectTextForTest({
+      content: [{ type: "text", text: "wrapped soul text" }],
+    }),
+    "wrapped soul text",
+  );
+
+  console.log("Test 0: MCP wrapped soul_inject response parsing ok");
+
   // ===== Test 1: OpenAI 格式注入 (原始测试) =====
   const requestBody1 = {
     model: "gpt-5.4",

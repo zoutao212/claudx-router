@@ -119,6 +119,17 @@ async function callMcpMethod(method: string, params?: Record<string, unknown>): 
   });
 }
 
+function extractSoulInjectText(result: unknown): string | null {
+  const content = Array.isArray(result)
+    ? result
+    : Array.isArray((result as any)?.content)
+      ? (result as any).content
+      : [];
+
+  const firstText = content.find((item: any) => item?.type === "text" && typeof item.text === "string");
+  return firstText?.text ?? null;
+}
+
 async function callSoulInject(userInput: string, context: string, tokenBudget: number, memoryTopK: number): Promise<string> {
   const result = await callMcpMethod("tools/call", {
     name: "soul_inject",
@@ -130,11 +141,16 @@ async function callSoulInject(userInput: string, context: string, tokenBudget: n
     },
   });
 
-  if (Array.isArray(result) && result[0]?.type === "text") {
-    return result[0].text;
+  const soulText = extractSoulInjectText(result);
+  if (soulText != null) {
+    return soulText;
   }
 
   throw new Error("Invalid soul_inject response");
+}
+
+export function extractSoulInjectTextForTest(result: unknown): string | null {
+  return extractSoulInjectText(result);
 }
 
 const CCR_SOUL_MARKER = "[CCR Soul Genome Auto Injection]";
