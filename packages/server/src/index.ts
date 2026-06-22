@@ -626,8 +626,111 @@ async function run() {
     console.log('Server object properties:', Object.keys(server));
     console.log('Server.start method exists:', typeof server.start);
     console.log('Calling server.start() synchronously...');
+    // NOTE: server.start() internally catches errors and calls process.exit(1),
+    // so we cannot rely on its rejection. Pre-flight bind-check on the port
+    // catches EACCES / EADDRINUSE *before* we hand control to the server.
+    //
+    // Lessons baked in (don't make me make these mistakes again):
+    //   1) Initial config injection overwrites the jsonPath PORT (config.ts:46
+    //      `this.config = { ...this.config, ...this.options.initialConfig }`).
+    //      This means SERVICE_PORT (or anything passed via initialConfig) can
+    //      hijack the value loaded from disk. We must read the on-disk
+    //      jsonPath directly to discover the user's *intended* port.
+    //   2) On Windows, reserved port ranges (e.g. 8026-8125, sometimes 100
+    //      ports wide) are blocked at the OS layer. Walking +1 at a time
+    //      across a reserved range is a complete waste — the whole range
+    //      fails. We need to *jump* past the suspect range, not inch forward.
+    //   3) Use a net.Server with exclusive:true as the probe so it doesn't
+    //      collide with fastify's own listener if the probe is opened in the
+    //      same process. The exclusive flag also matches how Windows exposes
+    //      reserved ports — they reject on bind(), not on connect().
+    const net = await import('net');
+    const { readFileSync, existsSync: existsSyncFs } = await import('fs');
+
+    // Discover the user's intended port straight from jsonPath, bypassing
+    // any initialConfig mutation that may have happened in getServer().
+    let userPort: number = 3456; // safe default — well outside Windows
+                                   // reserved ranges historically seen
+    let userHost: string = '127.0.0.1';
+    try {
+      const configJsonPath = (server as any).configService?.options?.jsonPath
+        || join(homedir(), '.claude-code-router', 'config.json');
+      if (existsSyncFs(configJsonPath)) {
+        const raw = JSON.parse(readFileSync(configJsonPath, 'utf-8'));
+        if (raw.PORT !== undefined) userPort = parseInt(String(raw.PORT), 10);
+        if (raw.HOST !== undefined) userHost = String(raw.HOST);
+        console.log(`[ccr] Pre-flight: read intended port ${userPort} from ${configJsonPath}`);
+      } else {
+        console.log(`[ccr] Pre-flight: configJsonPath not found (${configJsonPath}); using defaults.`);
+      }
+    } catch (e: any) {
+      console.warn(`[ccr] Pre-flight: failed to read jsonPath (${e?.message}); using defaults.`);
+    }
+
+    // If the user explicitly set SERVICE_PORT, respect it as a hint.
+    if (process.env.SERVICE_PORT) {
+      const envPort = parseInt(process.env.SERVICE_PORT, 10);
+      if (!Number.isNaN(envPort)) {
+        console.log(`[ccr] Pre-flight: SERVICE_PORT=${envPort} overrides jsonPath PORT.`);
+        userPort = envPort;
+      }
+    }
+
+    // Probe ports in two phases:
+    //   Phase A: try the user's exact port, then +1..+9 around it
+    //   Phase B: try a "safe" port far from the typical Windows reserved
+    //            ranges (e.g. 8200, 55000). These are almost always free.
+    const probeAttempts: number[] = [];
+    for (let off = 0; off < 10; off++) probeAttempts.push(userPort + off);
+    for (const safe of [8200, 8765, 55000, 3456, 5454]) {
+      if (!probeAttempts.includes(safe)) probeAttempts.push(safe);
+    }
+
+    let bindTargetPort: number | null = null;
+    let lastBindCode: string | undefined;
+    for (const port of probeAttempts) {
+      const probe = net.createServer();
+      const probeResult: { ok: boolean; code?: string } = await new Promise((resolve) => {
+        probe.once('error', (err: any) => resolve({ ok: false, code: err?.code }));
+        probe.once('listening', () => {
+          probe.close(() => resolve({ ok: true }));
+        });
+        try {
+          probe.listen({ port, host: userHost, exclusive: true });
+        } catch (err: any) {
+          resolve({ ok: false, code: err?.code });
+        }
+      });
+      if (probeResult.ok) {
+        bindTargetPort = port;
+        break;
+      }
+      lastBindCode = probeResult.code;
+      console.warn(
+        `[ccr] Pre-flight bind failed on ${userHost}:${port} (${probeResult.code}); trying next...`
+      );
+    }
+    if (bindTargetPort === null) {
+      throw new Error(
+        `Could not bind to any candidate port for userPort=${userPort} ` +
+        `(host=${userHost}, lastCode=${lastBindCode ?? 'unknown'}). ` +
+        `On Windows, ports inside reserved ranges (e.g. 8026-8125) cannot be bound by user processes. ` +
+        `Run 'netsh interface ipv4 show excludedportrange protocol=tcp' to see reserved ranges, ` +
+        `or set a different PORT in your config.`
+      );
+    }
+    if (bindTargetPort !== userPort) {
+      console.warn(
+        `[ccr] Configured PORT ${userPort} was unavailable; falling back to ${bindTargetPort}.`
+      );
+    }
+    // Patch the live config so server.start() — which reads PORT/HOST via
+    // configService.get("PORT") — picks up the resolved port. This also
+    // neutralizes any initialConfig injection that pointed at a bad port.
+    server.configService.set('PORT', bindTargetPort);
+    server.configService.set('HOST', userHost);
     const startPromise = server.start();
-    console.log('startPromise created:', startPromise instanceof Promise);
+    console.log('startPromise created: true');
     console.log('Starting server...');
     await startPromise;
     console.log('Server started successfully');
