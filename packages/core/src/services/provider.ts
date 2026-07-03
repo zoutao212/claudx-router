@@ -141,22 +141,11 @@ export class ProviderService {
     const hasClaudeModel = (providerConfig.models || []).some((entry: ModelEntry) =>
       normalizeModelName(entry).toLowerCase().startsWith("claude-")
     );
-    const apiTransformerName =
-      requestedApiTransformerName.toLowerCase() === "openai" &&
-      hasClaudeModel &&
-      baseUrlLower.includes("api.opeapi.cn") &&
-      this.transformerService.hasTransformer("Anthropic")
-        ? "Anthropic"
-        : requestedApiTransformerName;
-
-    if (
-      apiTransformerName !== requestedApiTransformerName &&
-      requestedApiTransformerName
-    ) {
-      this.logger.info(
-        `Provider '${providerConfig.name}' uses OpenAI-compatible endpoint for Claude model on opeapi.cn; routing upstream via Anthropic transformer to preserve prompt cache`
-      );
-    }
+    // Disabled: auto-routing OpenAI Claude providers on opeapi.cn through Anthropic transformer.
+    // This forced conversion broke prompt cache because the Anthropic transformer manipulates
+    // system/messages content (hoisting, warmup insertion, etc.), causing cache keys to differ
+    // across requests. Now OpenAI providers stay on the OpenAI transformer as configured.
+    const apiTransformerName = requestedApiTransformerName;
 
     if (!apiTransformerName) {
       return providerConfig;

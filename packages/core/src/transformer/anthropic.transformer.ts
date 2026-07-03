@@ -329,6 +329,15 @@ export class AnthropicTransformer implements Transformer {
       stream: request.stream,
     };
 
+    // Some upstream APIs (e.g. opeapi.cn for claude-sonnet-5) require that
+    // temperature, top_p, and top_k be omitted or set to their default values.
+    // When the provider option omitSamplingParams is true, strip them entirely.
+    if (provider.options?.omitSamplingParams) {
+      delete body.temperature;
+      delete body.top_p;
+      delete body.top_k;
+    }
+
     if (systemParts.length === 1) {
       body.system = systemParts[0].cache_control ? systemParts : systemParts[0].text;
     } else if (systemParts.length > 1) {
@@ -387,11 +396,11 @@ export class AnthropicTransformer implements Transformer {
     const shouldHoistLargeUserMessage = !enableMessageBreakpoints;
     if (shouldHoistLargeUserMessage) {
       this.hoistLargeUserMessageToSystem(body);
-      this.seedFirstHoistedTurnForCacheWarmup(body, provider);
+      // this.seedFirstHoistedTurnForCacheWarmup(body, provider);  ← 保持禁用
     }
     const useProxyToolCacheWorkaround = this.shouldUseProxyToolCacheWorkaround(provider, body);
     if (useProxyToolCacheWorkaround) {
-      this.moveToolSpecsIntoCachedSystemForProxy(body);
+      // this.moveToolSpecsIntoCachedSystemForProxy(body);  ← 禁用：导致 system 内容不稳定
       this.moveOversizedSystemTailToCachedUserTurn(body, provider);
     }
     this.ensureAnthropicCacheBreakpoints(body, provider, useProxyToolCacheWorkaround ? { skipToolsBreakpoint: true } : {});
@@ -1327,15 +1336,29 @@ export class AnthropicTransformer implements Transformer {
     const dynamicText = splitIndex === undefined ? "." : text.slice(splitIndex).trimStart();
     if (stableText.length < HOIST_THRESHOLD) return;
 
-    const systemBlock = {
-      type: "text",
-      text: stableText,
-    };
+    // Guard: prevent re-hoisting on subsequent requests.
+    // If the first message content was already split (short text or starts with
+    // a dynamic marker), skip hoisting to avoid appending duplicate blocks.
+    if (text.length < HOIST_THRESHOLD || first.content[0].text !== text) {
+      // Already hoisted or modified; only ensure system has the hoisted block
+      // if it doesn't already contain it.
+    }
 
     if (!Array.isArray(body.system)) {
       body.system = body.system ? [{ type: "text", text: body.system }] : [];
     }
-    body.system.push(systemBlock);
+
+    // Check if this exact stable text is already in system to avoid duplicates
+    const alreadyHoisted = body.system.some(
+      (block: any) => block?.type === "text" && block.text === stableText
+    );
+    if (!alreadyHoisted) {
+      const systemBlock = {
+        type: "text",
+        text: stableText,
+      };
+      body.system.push(systemBlock);
+    }
 
     first.content = [{ type: "text", text: dynamicText || "." }];
   }
@@ -1757,6 +1780,14 @@ export class AnthropicTransformer implements Transformer {
         let messageId = `chatcmpl-${Date.now()}`;
         let model = "";
         let currentToolCall: { id: string; name: string } | null = null;
+        // Track tool call index for proper multi-tool-call support.
+        // Anthropic content_block indices include text/thinking blocks, but
+        // OpenAI tool_calls are indexed independently (0, 1, 2…).  We map
+        // each new tool_use content_block to the next sequential OpenAI index.
+        let toolCallCount = 0;
+        // Map Anthropic content_block index → OpenAI tool_call index
+        const contentBlockToToolIndex = new Map<number, number>();
+        let currentContentBlockIndex = -1;
         let inputTokens = 0;
         let outputTokens = 0;
         let finished = false;
@@ -1835,7 +1866,11 @@ export class AnthropicTransformer implements Transformer {
 
           if (event.type === "content_block_start") {
             const block = event.content_block;
+            const cbIndex = event.index ?? 0;
+            currentContentBlockIndex = cbIndex;
             if (block?.type === "tool_use") {
+              const toolIndex = toolCallCount++;
+              contentBlockToToolIndex.set(cbIndex, toolIndex);
               currentToolCall = {
                 id: block.id || `call_${Date.now()}`,
                 name: block.name || "",
@@ -1851,7 +1886,7 @@ export class AnthropicTransformer implements Transformer {
                     delta: {
                       tool_calls: [
                         {
-                          index: 0,
+                          index: toolIndex,
                           id: currentToolCall.id,
                           type: "function",
                           function: {
@@ -1886,6 +1921,7 @@ export class AnthropicTransformer implements Transformer {
                 ],
               });
             } else if (delta?.type === "input_json_delta") {
+              const toolIndex = contentBlockToToolIndex.get(currentContentBlockIndex) ?? 0;
               enqueueChunk({
                 id: messageId,
                 object: "chat.completion.chunk",
@@ -1897,7 +1933,7 @@ export class AnthropicTransformer implements Transformer {
                     delta: {
                       tool_calls: [
                         {
-                          index: 0,
+                          index: toolIndex,
                           ...(currentToolCall?.id ? { id: currentToolCall.id } : {}),
                           type: "function",
                           function: {
