@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   Annotation,
   LLMProvider,
@@ -6,6 +7,7 @@ import {
   UnifiedMessage,
 } from "@/types/llm";
 import { Transformer, TransformerContext } from "@/types/transformer";
+import { writeCacheUsageDebug } from "@/utils/request";
 
 interface ResponsesAPIAnnotation {
   url?: string;
@@ -33,17 +35,46 @@ interface ResponsesAPIOutputItem {
   reasoning?: string;
 }
 
+interface ResponsesAPIUsage {
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  input_tokens_details?: {
+    cached_tokens?: number;
+    cache_write_tokens?: number;
+  };
+}
+
+interface ChatCompletionUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  prompt_tokens_details?: {
+    cached_tokens: number;
+  };
+}
+
+function mapResponsesUsage(usage: ResponsesAPIUsage | undefined): ChatCompletionUsage | undefined {
+  if (!usage) return undefined;
+
+  const cachedTokens = usage.input_tokens_details?.cached_tokens;
+  return {
+    prompt_tokens: usage.input_tokens || 0,
+    completion_tokens: usage.output_tokens || 0,
+    total_tokens: usage.total_tokens || 0,
+    ...(typeof cachedTokens === "number"
+      ? { prompt_tokens_details: { cached_tokens: cachedTokens } }
+      : {}),
+  };
+}
+
 interface ResponsesAPIPayload {
   id: string;
   object: string;
   model: string;
   created_at: number;
   output: ResponsesAPIOutputItem[];
-  usage?: {
-    input_tokens: number;
-    output_tokens: number;
-    total_tokens: number;
-  };
+  usage?: ResponsesAPIUsage;
 }
 
 interface ResponsesStreamEvent {
@@ -76,6 +107,7 @@ interface ResponsesStreamEvent {
     output?: Array<{
       type: string;
     }>;
+    usage?: ResponsesAPIUsage;
   };
   reasoning_summary?: string;
   choices?: Array<{
@@ -241,47 +273,217 @@ export class OpenAIResponsesTransformer implements Transformer {
     return null;
   }
 
+  private getConversationId(context?: TransformerContext): string | undefined {
+    const headers = context?.req?.headers;
+    const value = typeof headers?.get === "function"
+      ? headers.get("x-conversation-id")
+      : headers?.["x-conversation-id"];
+    return typeof value === "string" && value.trim() ? value.trim() : undefined;
+  }
+
+  private derivePromptCacheKey(request: Record<string, any>): string | undefined {
+    const messages = Array.isArray(request.messages) ? request.messages : [];
+    const input = Array.isArray(request.input) ? request.input : [];
+    const firstConversationItem = messages.find((message: any) => message?.role !== "system")
+      ?? input[0];
+
+    if (!firstConversationItem) return undefined;
+
+    const stableIdentity = {
+      model: request.model,
+      instructions: request.instructions
+        ?? request.system
+        ?? messages.filter((message: any) => message?.role === "system"),
+      tools: request.tools ?? [],
+      firstConversationItem,
+    };
+    const digest = createHash("sha256")
+      .update(JSON.stringify(stableIdentity))
+      .digest("hex")
+      .slice(0, 32);
+    return `ccr:${digest}`;
+  }
+
+  private getPromptCacheKey(request: Record<string, any>, context?: TransformerContext): string | undefined {
+    if (typeof request.prompt_cache_key === "string" && request.prompt_cache_key.trim()) {
+      return request.prompt_cache_key.trim();
+    }
+    if (!String(request.model || "").toLowerCase().includes("gpt")) {
+      return undefined;
+    }
+    const conversationId = this.getConversationId(context);
+    return conversationId
+      ? `cursor:${conversationId}`
+      : this.derivePromptCacheKey(request);
+  }
+
+  private getInstructionText(content: UnifiedMessage["content"]): string {
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return "";
+    return content
+      .filter((item): item is Extract<MessageContent, { type: "text" }> => item.type === "text")
+      .map((item) => item.text)
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  private normalizeResponsesContent(
+    content: UnifiedMessage["content"],
+    role: UnifiedMessage["role"]
+  ): Array<Record<string, unknown>> {
+    if (typeof content === "string") {
+      return content.length > 0
+        ? [{ type: role === "assistant" ? "output_text" : "input_text", text: content }]
+        : [];
+    }
+    if (!Array.isArray(content)) return [];
+    return content
+      .map((item) => this.normalizeRequestContent(item, role))
+      .filter((item): item is Record<string, unknown> => item !== null);
+  }
+
+  private normalizeResponsesInput(messages: UnifiedMessage[]): any[] {
+    return messages.flatMap((message) => {
+      if (message.role === "system") return [];
+      if (message.role === "tool") {
+        return [{
+          type: "function_call_output",
+          call_id: message.tool_call_id || "",
+          output: typeof message.content === "string"
+            ? message.content
+            : JSON.stringify(message.content || ""),
+        }];
+      }
+
+      const content = this.normalizeResponsesContent(message.content, message.role);
+      const messageItems = content.length > 0
+        ? [{ role: message.role, content }]
+        : [];
+      const toolItems = message.role === "assistant" && Array.isArray(message.tool_calls)
+        ? message.tool_calls.map((tool) => ({
+            type: "function_call",
+            arguments: tool.function.arguments,
+            name: tool.function.name,
+            call_id: tool.id,
+            status: "completed",
+          }))
+        : [];
+      return [...messageItems, ...toolItems];
+    });
+  }
+
+  private normalizeResponsesTools(tools: any[]): any[] {
+    const functionTools = tools
+      .filter((tool) => tool?.type === "function" && tool?.function?.name !== "web_search")
+      .map((tool) => {
+        const parameters = {
+          ...(tool.function.parameters || { type: "object" }),
+          properties: { ...(tool.function.parameters?.properties || {}) },
+        };
+        if (tool.function.name === "WebSearch") {
+          delete parameters.properties.allowed_domains;
+        }
+        if (tool.function.name === "Edit") {
+          parameters.required = ["file_path", "old_string", "new_string", "replace_all"];
+        }
+        return {
+          type: "function",
+          name: tool.function.name,
+          description: tool.function.description || "",
+          parameters,
+          ...(tool.function.name === "Edit" ? { strict: true } : {}),
+        };
+      });
+
+    return tools.some((tool) => tool?.function?.name === "web_search")
+      ? [...functionTools, { type: "web_search" }]
+      : functionTools;
+  }
+
+  private buildResponsesRequest(
+    request: UnifiedChatRequest,
+    context?: TransformerContext
+  ): Record<string, any> {
+    const source = request as any;
+    const {
+      messages: _messages,
+      tools: _tools,
+      temperature: _temperature,
+      max_tokens: _maxTokens,
+      max_completion_tokens: _maxCompletionTokens,
+      stream_options: _streamOptions,
+      ...rest
+    } = source;
+    const messages = Array.isArray(request.messages) ? request.messages : [];
+    const instructions = messages
+      .filter((message) => message.role === "system")
+      .map((message) => this.getInstructionText(message.content))
+      .filter((text) => text.length > 0)
+      .join("\n\n");
+    const input = this.normalizeResponsesInput(messages);
+    const tools = Array.isArray(request.tools)
+      ? this.normalizeResponsesTools(request.tools)
+      : [];
+    const promptCacheKey = this.getPromptCacheKey(source, context);
+    const maxOutputTokens = source.max_output_tokens
+      ?? source.max_completion_tokens
+      ?? source.max_tokens;
+    const reasoning = request.reasoning
+      ? { effort: request.reasoning.effort, summary: "detailed" }
+      : undefined;
+
+    return {
+      ...rest,
+      ...(instructions ? { instructions } : {}),
+      input,
+      ...(tools.length > 0 ? { tools } : {}),
+      ...(maxOutputTokens !== undefined ? { max_output_tokens: maxOutputTokens } : {}),
+      ...(promptCacheKey ? { prompt_cache_key: promptCacheKey } : {}),
+      ...(reasoning ? { reasoning } : {}),
+      store: source.store ?? false,
+      parallel_tool_calls: false,
+    };
+  }
+
   async transformRequestIn(
     request: UnifiedChatRequest,
-    provider: LLMProvider
+    provider: LLMProvider,
+    context?: TransformerContext
   ): Promise<UnifiedChatRequest | { body: UnifiedChatRequest; config: { url: URL; headers: Record<string, string> } }> {
     const normalizedPath = new URL(provider.baseUrl).pathname.replace(/\/+$/, "");
     const responsesHeaders = {
-      'Content-Type': 'application/json; charset=utf-8',
-      'Accept': 'text/event-stream, application/json, */*',
-      'Accept-Charset': 'utf-8',
-      'User-Agent': 'claude-code-router/2.0.0'
+      "Content-Type": "application/json; charset=utf-8",
+      "Accept": "text/event-stream, application/json, */*",
+      "Accept-Charset": "utf-8",
+      "User-Agent": "claude-code-router/2.0.0",
     };
 
-    // If this request was converted from Responses API format (Codex CLI),
-    // the upstream provider expects Chat Completions format.
-    // Skip the Responses API conversion and point URL to /chat/completions.
     if ((request as any)._fromResponsesApi) {
-      delete (request as any)._fromResponsesApi;
+      const { _fromResponsesApi, ...chatRequest } = request as any;
       return {
-        body: request,
+        body: chatRequest,
         config: {
           url: this.buildChatCompletionsUrl(provider.baseUrl),
           headers: {
-            'Content-Type': 'application/json; charset=utf-8',
-            'Accept': 'text/event-stream, application/json, */*',
+            "Content-Type": "application/json; charset=utf-8",
+            "Accept": "text/event-stream, application/json, */*",
           },
         },
       };
     }
 
-    // Already converted to Responses API format (e.g. openai-responses ran earlier
-    // at provider level, then again at model level). Only rewrite URL.
     if ((request as any).input && !(request as any).messages) {
-      // Still allow reasoning normalization on already-converted bodies
-      if (request.reasoning) {
-        (request as any).reasoning = {
-          effort: request.reasoning.effort,
-          summary: "detailed",
-        };
-      }
+      const source = request as any;
+      const promptCacheKey = this.getPromptCacheKey(source, context);
+      const body = {
+        ...source,
+        ...(source.reasoning
+          ? { reasoning: { effort: source.reasoning.effort, summary: "detailed" } }
+          : {}),
+        ...(promptCacheKey ? { prompt_cache_key: promptCacheKey } : {}),
+      };
       return {
-        body: request,
+        body,
         config: {
           url: this.buildResponsesUrl(provider.baseUrl),
           headers: responsesHeaders,
@@ -289,166 +491,21 @@ export class OpenAIResponsesTransformer implements Transformer {
       };
     }
 
-    // For requests from other transformers (e.g., Claude Code via Anthropic transformer),
-    // the request is already in Chat Completions format.
-    // Most upstream providers support Chat Completions, so passthrough directly
-    // instead of converting to Responses API format (which many providers don't support).
-    // Point URL to /chat/completions and keep the request as-is.
     if ((request as any).messages && !(request as any).input && !normalizedPath.endsWith("/responses")) {
       return {
         body: request,
         config: {
           url: this.buildChatCompletionsUrl(provider.baseUrl),
           headers: {
-            'Content-Type': 'application/json; charset=utf-8',
-            'Accept': 'text/event-stream, application/json, */*',
+            "Content-Type": "application/json; charset=utf-8",
+            "Accept": "text/event-stream, application/json, */*",
           },
         },
       };
     }
 
-    // Original logic: convert Chat Completions → Responses API format
-    // for upstream providers that support Responses API
-    delete request.temperature;
-    delete request.max_tokens;
-
-    // 处理 reasoning 参数
-    if (request.reasoning) {
-      (request as any).reasoning = {
-        effort: request.reasoning.effort,
-        summary: "detailed",
-      };
-    }
-
-    const input: any[] = [];
-    const messages = Array.isArray(request.messages) ? request.messages : [];
-
-    const systemMessages = messages.filter((msg) => msg.role === "system");
-    if (systemMessages.length > 0) {
-      const firstSystem = systemMessages[0];
-      if (Array.isArray(firstSystem.content)) {
-        const instructions = firstSystem.content
-          .map((item) => (item.type === "text" ? item.text : ""))
-          .filter(Boolean)
-          .join("\n");
-        if (instructions) {
-          (request as any).instructions = instructions;
-        }
-      } else if (typeof firstSystem.content === "string") {
-        (request as any).instructions = firstSystem.content;
-      }
-    }
-
-    messages.forEach((message) => {
-      if (message.role === "system") return;
-
-      if (Array.isArray(message.content)) {
-        const convertedContent = message.content
-          .map((content) => this.normalizeRequestContent(content, message.role))
-          .filter(
-            (content): content is Record<string, unknown> => content !== null
-          );
-
-        if (convertedContent.length > 0) {
-          (message as any).content = convertedContent;
-        } else {
-          delete (message as any).content;
-        }
-      }
-
-      if (message.role === "tool") {
-        const toolMessage: any = { ...message };
-        toolMessage.type = "function_call_output";
-        toolMessage.call_id = message.tool_call_id;
-        toolMessage.output =
-          typeof message.content === "string"
-            ? message.content
-            : JSON.stringify(message.content);
-        delete toolMessage.cache_control;
-        delete toolMessage.role;
-        delete toolMessage.tool_call_id;
-        delete toolMessage.content;
-        input.push(toolMessage);
-        return;
-      }
-
-      if (message.role === "assistant" && Array.isArray(message.tool_calls)) {
-        if (this.hasMessageContent(message.content)) {
-          input.push({
-            role: "assistant",
-            content: message.content,
-          });
-        }
-
-        message.tool_calls.forEach((tool) => {
-          input.push({
-            type: "function_call",
-            arguments: tool.function.arguments,
-            name: tool.function.name,
-            call_id: tool.id,
-          });
-        });
-        return;
-      }
-
-      input.push(message);
-    });
-
-    (request as any).input = input;
-    delete (request as any).messages;
-
-    if (Array.isArray(request.tools)) {
-      const webSearch = request.tools.find(
-        (tool) => tool.function.name === "web_search"
-      );
-
-      (request as any).tools = request.tools
-        .filter((tool) => tool.function.name !== "web_search")
-        .map((tool) => {
-          const parameters = {
-            ...tool.function.parameters,
-            properties: { ...tool.function.parameters.properties },
-          };
-
-          if (tool.function.name === "WebSearch") {
-            delete parameters.properties.allowed_domains;
-          }
-          if (tool.function.name === "Edit") {
-            return {
-              type: tool.type,
-              name: tool.function.name,
-              description: tool.function.description,
-              parameters: {
-                ...parameters,
-                required: [
-                  "file_path",
-                  "old_string",
-                  "new_string",
-                  "replace_all",
-                ],
-              },
-              strict: true,
-            };
-          }
-          return {
-            type: tool.type,
-            name: tool.function.name,
-            description: tool.function.description,
-            parameters,
-          };
-        });
-
-      if (webSearch) {
-        (request as any).tools.push({
-          type: "web_search",
-        });
-      }
-    }
-
-    (request as any).parallel_tool_calls = false;
-
     return {
-      body: request,
+      body: this.buildResponsesRequest(request, context) as UnifiedChatRequest,
       config: {
         url: this.buildResponsesUrl(provider.baseUrl),
         headers: responsesHeaders,
@@ -456,7 +513,7 @@ export class OpenAIResponsesTransformer implements Transformer {
     };
   }
 
-  async transformResponseOut(response: Response): Promise<Response> {
+  async transformResponseOut(response: Response, context?: TransformerContext): Promise<Response> {
     const contentType = response.headers.get("Content-Type") || "";
 
     if (contentType.includes("application/json")) {
@@ -464,7 +521,13 @@ export class OpenAIResponsesTransformer implements Transformer {
 
       // 检查是否为responses API格式的JSON响应
       if (jsonResponse.object === "response" && jsonResponse.output) {
-        // 将responses格式转换为chat格式
+        if (jsonResponse.usage) {
+          writeCacheUsageDebug(
+            context?.req?.id,
+            jsonResponse.usage,
+            { source: "openai_responses_json" },
+          );
+        }
         const chatResponse = this.convertResponseToChat(jsonResponse);
         return new Response(JSON.stringify(chatResponse), {
           status: response.status,
@@ -874,12 +937,19 @@ export class OpenAIResponsesTransformer implements Transformer {
                           );
                         }
                       } else if (data.type === "response.completed") {
-                        // 发送结束标记 - 检查是否是tool_calls完成
                         const finishReason = data.response?.output?.some(
                           (item: any) => item.type === "function_call"
                         )
                           ? "tool_calls"
                           : "stop";
+                        const usage = mapResponsesUsage(data.response?.usage);
+                        if (data.response?.usage) {
+                          writeCacheUsageDebug(
+                            context?.req?.id,
+                            data.response.usage as unknown as Record<string, unknown>,
+                            { source: "openai_responses_response_completed" },
+                          );
+                        }
 
                         const endChunk = {
                           id: data.response?.id || "chatcmpl-" + Date.now(),
@@ -893,6 +963,7 @@ export class OpenAIResponsesTransformer implements Transformer {
                               finish_reason: finishReason,
                             },
                           ],
+                          ...(usage ? { usage } : {}),
                         };
 
                         controller.enqueue(
@@ -1261,13 +1332,7 @@ export class OpenAIResponsesTransformer implements Transformer {
           finish_reason: toolCalls ? "tool_calls" : "stop",
         },
       ],
-      usage: responseData.usage
-        ? {
-            prompt_tokens: responseData.usage.input_tokens || 0,
-            completion_tokens: responseData.usage.output_tokens || 0,
-            total_tokens: responseData.usage.total_tokens || 0,
-          }
-        : null,
+      usage: mapResponsesUsage(responseData.usage) || null,
     };
 
     return chatResponse;

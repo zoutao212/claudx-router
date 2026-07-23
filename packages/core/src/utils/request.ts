@@ -28,7 +28,8 @@ function stableStringify(value: unknown): string {
 }
 
 function sha256Short(value: unknown): string {
-  return createHash("sha256").update(stableStringify(value)).digest("hex").slice(0, 16);
+  const serialized = stableStringify(value);
+  return createHash("sha256").update(serialized === undefined ? "undefined" : serialized).digest("hex").slice(0, 16);
 }
 
 function sanitizeLogPreview(text: string): string {
@@ -682,169 +683,240 @@ function writePerRequestMessageAuditLog(reqId: string | undefined, request: any)
   }
 }
 
-function writeCacheDebugLog(reqId: string | undefined, request: any, summary: Record<string, unknown>): void {
-  try {
-    const system = request?.system;
-    const tools = request?.tools;
-    const messages = Array.isArray(request?.messages) ? request.messages : [];
+type CachePromptItemSummary = {
+  index: number;
+  type: string;
+  role?: string;
+  name?: string;
+  chars: number;
+  bytes: number;
+  hash: string;
+};
 
-    // Compute per-block hashes for system
-    const systemBlocks = Array.isArray(system) ? system.map((block: any, i: number) => ({
-      index: i,
-      type: block?.type,
-      length: typeof block?.text === "string" ? block.text.length : JSON.stringify(block || "").length,
-      hasCacheControl: !!block?.cache_control,
-      hash: sha256Short(block),
-      preview: typeof block?.text === "string" ? block.text.slice(0, 80) + "..." : undefined,
-    })) : typeof system === "string" ? [{ type: "string", length: system.length, hash: sha256Short(system) }] : [];
+type CacheRequestSnapshot = {
+  reqId?: string;
+  format: string;
+  model: unknown;
+  promptCacheKeyHash?: string;
+  controlsHash: string;
+  instructionsHash: string;
+  tools: CachePromptItemSummary[];
+  input: CachePromptItemSummary[];
+};
 
-    // Compute per-tool hash (just first and last for brevity)
-    const toolsSummary = Array.isArray(tools) ? {
-      count: tools.length,
-      names: tools.map((tool: any) => tool?.name || tool?.function?.name).filter(Boolean),
-      totalChars: JSON.stringify(tools).length,
-      lastToolHash: tools.length > 0 ? sha256Short(tools[tools.length - 1]) : undefined,
-      lastToolHasCacheControl: tools.length > 0 ? !!tools[tools.length - 1]?.cache_control : false,
-      allToolsHash: sha256Short(tools),
-    } : undefined;
+const cacheDebugLastRequests = new Map<string, CacheRequestSnapshot>();
 
-    // Per-message structure (content hash, cache_control presence)
-    const messagesDetail = messages.map((msg: any, i: number) => {
-      const content = msg?.content;
-      const blocks = Array.isArray(content) ? content : [];
-      return {
-        index: i,
-        role: msg?.role,
-        blockCount: blocks.length,
-        totalLength: getContentLength(content),
-        contentHash: sha256Short(content),
-        blocks: blocks.slice(0, 3).map((b: any, j: number) => ({
-          index: j,
-          type: b?.type,
-          length: typeof b?.text === "string" ? b.text.length :
-                  typeof b?.content === "string" ? b.content.length :
-                  JSON.stringify(b || "").length,
-          hasCacheControl: !!b?.cache_control,
-          hash: sha256Short(b),
-        })),
+function getJsonBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value ?? null), "utf8");
+}
+
+function getPromptItemChars(item: any): number {
+  if (typeof item === "string") return item.length;
+  if (typeof item?.output === "string") return item.output.length;
+  if (item?.content !== undefined) return getContentLength(item.content);
+  if (typeof item?.arguments === "string") return item.arguments.length;
+  return JSON.stringify(item ?? null).length;
+}
+
+function summarizePromptItems(items: any[]): CachePromptItemSummary[] {
+  return items.map((item, index) => ({
+    index,
+    type: typeof item?.type === "string" ? item.type : "message",
+    ...(typeof item?.role === "string" ? { role: item.role } : {}),
+    ...(typeof item?.name === "string" ? { name: item.name } : {}),
+    chars: getPromptItemChars(item),
+    bytes: getJsonBytes(item),
+    hash: sha256Short(item),
+  }));
+}
+
+function getCommonPromptItemCount(
+  previous: CachePromptItemSummary[],
+  current: CachePromptItemSummary[],
+): number {
+  let index = 0;
+  while (
+    index < previous.length &&
+    index < current.length &&
+    previous[index].hash === current[index].hash
+  ) {
+    index++;
+  }
+  return index;
+}
+
+function describeCacheRequestDiff(
+  previous: CacheRequestSnapshot | undefined,
+  current: CacheRequestSnapshot,
+): Record<string, unknown> | undefined {
+  if (!previous) return undefined;
+  if (previous.model !== current.model) {
+    return { section: "model", previous: previous.model, current: current.model };
+  }
+  if (previous.promptCacheKeyHash !== current.promptCacheKeyHash) {
+    return {
+      section: "prompt_cache_key",
+      previousHash: previous.promptCacheKeyHash,
+      currentHash: current.promptCacheKeyHash,
+    };
+  }
+  if (previous.controlsHash !== current.controlsHash) {
+    return {
+      section: "controls",
+      previousHash: previous.controlsHash,
+      currentHash: current.controlsHash,
+    };
+  }
+  if (previous.instructionsHash !== current.instructionsHash) {
+    return {
+      section: "instructions",
+      previousHash: previous.instructionsHash,
+      currentHash: current.instructionsHash,
+    };
+  }
+
+  const commonTools = getCommonPromptItemCount(previous.tools, current.tools);
+  if (commonTools !== previous.tools.length || commonTools !== current.tools.length) {
+    return {
+      section: "tools",
+      index: commonTools,
+      previous: previous.tools[commonTools],
+      current: current.tools[commonTools],
+    };
+  }
+
+  const commonInputItems = getCommonPromptItemCount(previous.input, current.input);
+  const previousInputChars = previous.input
+    .slice(0, commonInputItems)
+    .reduce((sum, item) => sum + item.chars, 0);
+  if (commonInputItems === previous.input.length && current.input.length >= previous.input.length) {
+    return {
+      section: "input_append",
+      commonInputItems,
+      commonInputChars: previousInputChars,
+      appendedItems: current.input.length - previous.input.length,
+    };
+  }
+  if (commonInputItems !== previous.input.length || commonInputItems !== current.input.length) {
+    return {
+      section: "input",
+      index: commonInputItems,
+      commonInputItems,
+      commonInputChars: previousInputChars,
+      previous: previous.input[commonInputItems],
+      current: current.input[commonInputItems],
+    };
+  }
+  return { section: "identical" };
+}
+
+function buildCacheTraceSummary(request: any): Record<string, unknown> {
+  const format = Array.isArray(request?.input) && !Array.isArray(request?.messages)
+    ? "responses"
+    : Array.isArray(request?.messages)
+      ? "chat_completions"
+      : "unknown";
+  const messages = Array.isArray(request?.messages) ? request.messages : [];
+  const input = format === "responses" ? request.input : messages;
+  const tools = Array.isArray(request?.tools) ? request.tools : [];
+  const instructions = format === "responses"
+    ? request?.instructions ?? ""
+    : {
+        system: request?.system ?? null,
+        messages: messages.filter((message: any) => message?.role === "system"),
       };
-    });
+  const promptCacheKey = typeof request?.prompt_cache_key === "string"
+    ? request.prompt_cache_key
+    : undefined;
+  const controls = {
+    model: request?.model,
+    reasoning: request?.reasoning,
+    tool_choice: request?.tool_choice,
+    parallel_tool_calls: request?.parallel_tool_calls,
+    truncation: request?.truncation,
+  };
+  const inputItems = summarizePromptItems(input);
+  const toolItems = summarizePromptItems(tools);
 
-    // Full body hash (what actually gets sent)
-    const fullBodyHash = sha256Short(request);
-    const cacheAttributionSummary = summarizeRequestForCacheAttribution(request);
+  return {
+    format,
+    model: request?.model,
+    stream: request?.stream,
+    promptCacheKeyPresent: Boolean(promptCacheKey),
+    promptCacheKeyHash: promptCacheKey ? sha256Short(promptCacheKey) : undefined,
+    controlsHash: sha256Short(controls),
+    instructionsChars: getContentLength(instructions),
+    instructionsHash: sha256Short(instructions),
+    toolCount: tools.length,
+    toolsChars: tools.reduce((sum: number, tool: any) => sum + getPromptItemChars(tool), 0),
+    toolsHash: sha256Short(tools),
+    tools: toolItems,
+    inputCount: input.length,
+    inputChars: inputItems.reduce((sum, item) => sum + item.chars, 0),
+    inputHash: sha256Short(input),
+    inputItems,
+    bodyBytes: getJsonBytes(request),
+    bodyHash: sha256Short(request),
+    topLevelFieldOrder: Object.keys(request || {}),
+  };
+}
+
+function writeCacheDebugLog(
+  reqId: string | undefined,
+  request: any,
+  summary: Record<string, unknown>,
+  requestUrl: string,
+): void {
+  try {
+    const format = String(summary.format || "unknown");
+    const tools = Array.isArray(summary.tools)
+      ? summary.tools as CachePromptItemSummary[]
+      : [];
+    const input = Array.isArray(summary.inputItems)
+      ? summary.inputItems as CachePromptItemSummary[]
+      : [];
+    const snapshot: CacheRequestSnapshot = {
+      reqId,
+      format,
+      model: request?.model,
+      promptCacheKeyHash: typeof summary.promptCacheKeyHash === "string"
+        ? summary.promptCacheKeyHash
+        : undefined,
+      controlsHash: String(summary.controlsHash),
+      instructionsHash: String(summary.instructionsHash),
+      tools,
+      input,
+    };
+    const cacheKey = snapshot.promptCacheKeyHash
+      || `${String(request?.model || "unknown")}:${requestUrl}`;
+    const previous = cacheDebugLastRequests.get(cacheKey);
+    const adjacentDiff = describeCacheRequestDiff(previous, snapshot);
+
     if (reqId) {
-      cacheDebugRequestSummaries.set(reqId, cacheAttributionSummary);
-      // Avoid unbounded growth in long-running processes.
+      cacheDebugRequestSummaries.set(reqId, summary);
       if (cacheDebugRequestSummaries.size > 200) {
         const oldestKey = cacheDebugRequestSummaries.keys().next().value;
         if (oldestKey) cacheDebugRequestSummaries.delete(oldestKey);
       }
     }
+    cacheDebugLastRequests.set(cacheKey, snapshot);
+    if (cacheDebugLastRequests.size > 200) {
+      const oldestKey = cacheDebugLastRequests.keys().next().value;
+      if (oldestKey) cacheDebugLastRequests.delete(oldestKey);
+    }
 
-    const record = {
+    appendCacheDebugRecord({
       ts: new Date().toISOString(),
       kind: "cache_request_structure",
       reqId,
-      fullBodyHash,
-      cacheAttributionSummary,
-      systemBlocks,
-      toolsSummary,
-      messagesDetail,
+      requestUrl,
+      previousReqId: previous?.reqId,
+      adjacentDiff,
       summary,
-    };
-
-    appendCacheDebugRecord(record);
+    });
   } catch {
-    // Silently ignore debug log errors
+    // Cache diagnostics must never affect the request path.
   }
-}
-
-function buildCacheTraceSummary(request: any): Record<string, unknown> {
-  const messages = Array.isArray(request?.messages) ? request.messages : [];
-  const topLevelSystem = Array.isArray(request?.system)
-    ? request.system
-    : typeof request?.system === "string"
-      ? [{ type: "text", text: request.system }]
-      : [];
-  const systemMessages = messages.filter((message: any) => message?.role === "system");
-  const nonSystemMessages = messages.filter((message: any) => message?.role !== "system");
-  const tools = Array.isArray(request?.tools) ? request.tools : [];
-  const prefixMessages = nonSystemMessages.slice(0, Math.max(0, nonSystemMessages.length - 1));
-  const messageLengths = messages.map((message: any, index: number) => ({
-    index,
-    role: message?.role,
-    length: getContentLength(message?.content),
-  }));
-  const largestMessages = [...messageLengths]
-    .sort((a, b) => b.length - a.length)
-    .slice(0, 5);
-
-  const cacheControlLocations = collectCacheControlLocations(request, messages);
-  const expectedCachedPrefixChars = cacheControlLocations.reduce((max: number, location: any) => {
-    if (location.location === "system") {
-      const index = typeof location.blockIndex === "number" ? location.blockIndex : -1;
-      const chars = topLevelSystem
-        .slice(0, index + 1)
-        .reduce((sum: number, block: any) => sum + getContentLength([block]), 0);
-      return Math.max(max, chars);
-    }
-    if (location.location === "message_content") {
-      const messageIndex = typeof location.messageIndex === "number" ? location.messageIndex : -1;
-      const blockIndex = typeof location.blockIndex === "number" ? location.blockIndex : -1;
-      const systemChars = topLevelSystem.reduce((sum: number, block: any) => sum + getContentLength([block]), 0);
-      const priorMessageChars = messages
-        .slice(0, messageIndex)
-        .reduce((sum: number, message: any) => sum + getContentLength(message?.content), 0);
-      const message = messages[messageIndex];
-      const blocks = Array.isArray(message?.content) ? message.content : [];
-      const blockChars = blocks
-        .slice(0, blockIndex + 1)
-        .reduce((sum: number, block: any) => sum + getContentLength([block]), 0);
-      return Math.max(max, systemChars + priorMessageChars + blockChars);
-    }
-    return max;
-  }, 0);
-
-  // Hash message[0] separately to detect dynamic content injection (e.g. timestamps)
-  const message0Hash = messages.length > 0 ? sha256Short(messages[0]?.content) : undefined;
-  // Capture head/tail of message[0] content for visual diff across requests
-  const message0Preview = (() => {
-    if (messages.length === 0) return undefined;
-    const content = messages[0]?.content;
-    let text = "";
-    if (typeof content === "string") {
-      text = content;
-    } else if (Array.isArray(content) && content[0]?.text) {
-      text = content[0].text;
-    }
-    if (!text) return undefined;
-    const head = sanitizeLogPreview(text.slice(0, 120));
-    const tail = sanitizeLogPreview(text.slice(-120));
-    return { head, tail };
-  })();
-
-  return {
-    model: request?.model,
-    stream: request?.stream,
-    streamIncludeUsage: request?.stream_options?.include_usage === true,
-    messageCount: messages.length,
-    systemCount: topLevelSystem.length + systemMessages.length,
-    toolCount: tools.length,
-    totalMessageChars: messageLengths.reduce((sum, item) => sum + item.length, 0),
-    topLevelSystemChars: topLevelSystem.reduce((sum: number, block: any) => sum + getContentLength([block]), 0),
-    prefixChars: prefixMessages.reduce((sum: number, message: any) => sum + getContentLength(message?.content), 0),
-    largestMessages,
-    cacheControlLocations,
-    expectedCachedPrefixChars,
-    expectedCachedPrefixEstTokens: estimateTokensFromChars(expectedCachedPrefixChars),
-    systemHash: sha256Short(topLevelSystem),
-    toolsHash: sha256Short(tools),
-    message0Hash,
-    message0Preview,
-    prefixHash: sha256Short(prefixMessages),
-    fullMessagesHash: sha256Short(messages),
-  };
 }
 
 export function sendUnifiedRequest(
@@ -900,7 +972,7 @@ export function sendUnifiedRequest(
 
   // CACHE_DEBUG: write detailed request body analysis to a separate log file
   if (process.env.CCR_CACHE_DEBUG === "1") {
-    writeCacheDebugLog(context?.req?.id, finalRequest, cacheTraceSummary);
+    writeCacheDebugLog(context?.req?.id, finalRequest, cacheTraceSummary, requestUrl);
   }
 
   logger?.info?.(

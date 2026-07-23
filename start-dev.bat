@@ -49,9 +49,9 @@ echo   - Web UI: http://127.0.0.1:3456
 echo   - Config API: http://127.0.0.1:3456/api/config
 echo   - Config: C:\Users\zouta\.claude-code-router\config.json
 echo.
-echo Trace logging enabled: CCR_TRACE=1
-echo History diff audit enabled: CCR_HISTORY_DIFF_AUDIT=1
-echo Trace logs will be written to: logs\trace\YYYY-MM-DD.jsonl
+echo Safe cache diagnostics enabled: CCR_CACHE_DEBUG=1
+echo Full request trace/audits disabled to avoid persisting prompts and source code
+echo Cache diagnostics will be written to: C:\Users\zouta\.claude-code-router\logs\cache-debug-YYYYMMDD.jsonl
 echo.
 echo Press Ctrl+C to stop the server
 echo ========================================
@@ -61,7 +61,7 @@ set CCR_TRACE=0
 set CCR_HISTORY_DIFF_AUDIT=0
 set CCR_FULL_REQUEST_AUDIT=0
 set CCR_MESSAGE_AUDIT=0
-set CCR_CACHE_DEBUG=0
+set CCR_CACHE_DEBUG=1
 set SERVICE_PORT=3456
 set CCR_UPSTREAM_RETRY_TOTAL_MS=15000
 set CCR_UPSTREAM_RETRY_MAX=5

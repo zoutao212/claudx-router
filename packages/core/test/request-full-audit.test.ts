@@ -7,10 +7,12 @@ import type { UnifiedChatRequest } from "../src/types/llm";
 
 const auditDir = mkdtempSync(join(tmpdir(), "ccr-request-audit-"));
 const oldAuditDir = process.env.CCR_MESSAGE_AUDIT_DIR;
+const oldMessageAudit = process.env.CCR_MESSAGE_AUDIT;
 const oldFullAudit = process.env.CCR_FULL_REQUEST_AUDIT;
 const oldFetch = globalThis.fetch;
 
 process.env.CCR_MESSAGE_AUDIT_DIR = auditDir;
+process.env.CCR_MESSAGE_AUDIT = "1";
 process.env.CCR_FULL_REQUEST_AUDIT = "1";
 
 let capturedBody = "";
@@ -67,6 +69,8 @@ try {
   globalThis.fetch = oldFetch;
   if (oldAuditDir === undefined) delete process.env.CCR_MESSAGE_AUDIT_DIR;
   else process.env.CCR_MESSAGE_AUDIT_DIR = oldAuditDir;
+  if (oldMessageAudit === undefined) delete process.env.CCR_MESSAGE_AUDIT;
+  else process.env.CCR_MESSAGE_AUDIT = oldMessageAudit;
   if (oldFullAudit === undefined) delete process.env.CCR_FULL_REQUEST_AUDIT;
   else process.env.CCR_FULL_REQUEST_AUDIT = oldFullAudit;
   rmSync(auditDir, { recursive: true, force: true });
