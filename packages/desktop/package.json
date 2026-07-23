@@ -1,0 +1,31 @@
+{
+  "name": "@CCR/desktop",
+  "version": "2.0.0",
+  "private": true,
+  "main": "dist/main.js",
+  "scripts": {
+    "dev": "pnpm build && electron dist/main.js",
+    "build": "pnpm build:main && pnpm build:renderer",
+    "build:main": "esbuild src/main.ts src/preload.ts --bundle --platform=node --target=node20 --format=cjs --outdir=dist --external:electron && shx cp assets/tray.png dist/tray.png",
+    "build:renderer": "vite build --config vite.renderer.config.ts",
+    "start": "electron dist/main.js",
+    "lint": "eslint src --ext ts,tsx"
+  },
+  "dependencies": {
+    "@CCR/shared": "workspace:*",
+    "@vitejs/plugin-react": "latest",
+    "lucide-react": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "vite": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "electron": "latest",
+    "esbuild": "latest",
+    "tsx": "latest",
+    "typescript": "latest"
+  }
+}

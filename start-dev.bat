@@ -57,8 +57,11 @@ echo Press Ctrl+C to stop the server
 echo ========================================
 echo.
 
-set CCR_TRACE=1
-set CCR_HISTORY_DIFF_AUDIT=1
+set CCR_TRACE=0
+set CCR_HISTORY_DIFF_AUDIT=0
+set CCR_FULL_REQUEST_AUDIT=0
+set CCR_MESSAGE_AUDIT=0
+set CCR_CACHE_DEBUG=0
 set SERVICE_PORT=3456
 set CCR_UPSTREAM_RETRY_TOTAL_MS=15000
 set CCR_UPSTREAM_RETRY_MAX=5

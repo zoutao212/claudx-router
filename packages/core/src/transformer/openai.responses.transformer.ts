@@ -246,6 +246,12 @@ export class OpenAIResponsesTransformer implements Transformer {
     provider: LLMProvider
   ): Promise<UnifiedChatRequest | { body: UnifiedChatRequest; config: { url: URL; headers: Record<string, string> } }> {
     const normalizedPath = new URL(provider.baseUrl).pathname.replace(/\/+$/, "");
+    const responsesHeaders = {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Accept': 'text/event-stream, application/json, */*',
+      'Accept-Charset': 'utf-8',
+      'User-Agent': 'claude-code-router/2.0.0'
+    };
 
     // If this request was converted from Responses API format (Codex CLI),
     // the upstream provider expects Chat Completions format.
@@ -261,6 +267,25 @@ export class OpenAIResponsesTransformer implements Transformer {
             'Accept': 'text/event-stream, application/json, */*',
           },
         },
+      };
+    }
+
+    // Already converted to Responses API format (e.g. openai-responses ran earlier
+    // at provider level, then again at model level). Only rewrite URL.
+    if ((request as any).input && !(request as any).messages) {
+      // Still allow reasoning normalization on already-converted bodies
+      if (request.reasoning) {
+        (request as any).reasoning = {
+          effort: request.reasoning.effort,
+          summary: "detailed",
+        };
+      }
+      return {
+        body: request,
+        config: {
+          url: this.buildResponsesUrl(provider.baseUrl),
+          headers: responsesHeaders,
+        } as any,
       };
     }
 
@@ -296,8 +321,9 @@ export class OpenAIResponsesTransformer implements Transformer {
     }
 
     const input: any[] = [];
+    const messages = Array.isArray(request.messages) ? request.messages : [];
 
-    const systemMessages = request.messages.filter((msg) => msg.role === "system");
+    const systemMessages = messages.filter((msg) => msg.role === "system");
     if (systemMessages.length > 0) {
       const firstSystem = systemMessages[0];
       if (Array.isArray(firstSystem.content)) {
@@ -313,7 +339,7 @@ export class OpenAIResponsesTransformer implements Transformer {
       }
     }
 
-    request.messages.forEach((message) => {
+    messages.forEach((message) => {
       if (message.role === "system") return;
 
       if (Array.isArray(message.content)) {
@@ -425,12 +451,7 @@ export class OpenAIResponsesTransformer implements Transformer {
       body: request,
       config: {
         url: this.buildResponsesUrl(provider.baseUrl),
-        headers: {
-          'Content-Type': 'application/json; charset=utf-8',
-          'Accept': 'text/event-stream, application/json, */*',
-          'Accept-Charset': 'utf-8',
-          'User-Agent': 'claude-code-router/2.0.0'
-        }
+        headers: responsesHeaders,
       } as any,
     };
   }

@@ -15,6 +15,7 @@ const sidebars: SidebarsConfig = {
         'cli/intro',
         'cli/installation',
         'cli/quick-start',
+        'cli/desktop',
         {
           type: 'category',
           label: 'Commands',

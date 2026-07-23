@@ -21,6 +21,9 @@ import {
   type PresetFile,
   type ManifestFile,
   type PresetMetadata,
+  readConfigDocument,
+  redactConfig,
+  writeConfigDocument,
 } from "@CCR/shared";
 import fastifyMultipart from "@fastify/multipart";
 import AdmZip from "adm-zip";
@@ -29,7 +32,11 @@ export const createServer = async (config: any): Promise<any> => {
   try {
     const safeConfig = {
       jsonPath: config?.jsonPath,
-      initialConfig: config?.initialConfig,
+      initialConfig: {
+        providerCount: Array.isArray(config?.initialConfig?.providers) ? config.initialConfig.providers.length : 0,
+        host: config?.initialConfig?.HOST,
+        port: config?.initialConfig?.PORT,
+      },
       hasLogger: Boolean(config?.logger),
       loggerType: typeof config?.logger,
     };
@@ -128,18 +135,38 @@ export const createServer = async (config: any): Promise<any> => {
     return { transformers: transformerList };
   });
 
+  app.get("/api/config/document", async (_req: any, reply: any) => {
+    try {
+      const document = await readConfigDocument();
+      return {
+        config: redactConfig(document.value),
+        revision: document.revision,
+        sourceWillBeFormatted: true,
+      };
+    } catch (error: any) {
+      return reply.status(500).send({ error: error.message || "Failed to read configuration" });
+    }
+  });
+
   // Add endpoint to save config.json with access control
   app.post("/api/config", async (req: any, reply: any) => {
-    const newConfig = req.body;
-
-    // Backup existing config file if it exists
-    const backupPath = await backupConfigFile();
-    if (backupPath) {
-      console.log(`Backed up existing configuration file to ${backupPath}`);
+    try {
+      const result = await writeConfigDocument(req.body);
+      return { success: true, message: "Config saved successfully", ...result };
+    } catch (error: any) {
+      return reply.status(400).send({ success: false, error: error.message || "Invalid configuration" });
     }
+  });
 
-    await writeConfigFile(newConfig);
-    return { success: true, message: "Config saved successfully" };
+  app.post("/api/config/document", async (req: any, reply: any) => {
+    try {
+      const { config, revision } = req.body || {};
+      const result = await writeConfigDocument(config, revision);
+      return { success: true, ...result };
+    } catch (error: any) {
+      const isConflict = error.message === "Configuration changed on disk. Reload before saving.";
+      return reply.status(isConflict ? 409 : 400).send({ success: false, error: error.message || "Invalid configuration" });
+    }
   });
 
   // Register static file serving with caching

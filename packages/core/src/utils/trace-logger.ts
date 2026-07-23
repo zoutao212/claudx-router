@@ -27,6 +27,9 @@ const sseConsoleBuffers = new Map<
   }
 >();
 
+// Always-on SSE preview buffers (independent of CCR_TRACE / CCR_TRACE_CONSOLE)
+const ssePreviewBuffers = new Map<string, { text: string; lastFlushAt: number }>();
+
 function asNumberEnv(name: string, fallback: number): number {
   const raw = process.env[name];
   if (!raw) return fallback;
@@ -133,6 +136,87 @@ export function redactHeaders(headers: unknown): Record<string, unknown> {
   return out;
 }
 
+/** 从原始 SSE data: 行里抽取模型输出的文字内容 */
+function extractSseText(raw: string): string {
+  let extracted = "";
+  const lines = raw.split("\n");
+  for (const line of lines) {
+    if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
+    try {
+      const json = JSON.parse(line.slice(6));
+      // Claude 格式: delta.text
+      if (typeof json.delta?.text === "string") { extracted += json.delta.text; continue; }
+      // OpenAI 格式: choices[0].delta.content
+      if (typeof json.choices?.[0]?.delta?.content === "string") { extracted += json.choices[0].delta.content; }
+    } catch { /* ignore */ }
+  }
+  return extracted || raw.slice(0, 80);
+}
+
+/** 从非流 JSON 响应体里抽取模型回答文字 */
+function extractJsonPreview(bodyText: string, maxLen: number): string {
+  try {
+    const json = JSON.parse(bodyText);
+    // Claude 格式: content[0].text
+    if (typeof json.content?.[0]?.text === "string") {
+      return json.content[0].text.slice(0, maxLen);
+    }
+    // OpenAI 格式: choices[0].message.content
+    if (typeof json.choices?.[0]?.message?.content === "string") {
+      return json.choices[0].message.content.slice(0, maxLen);
+    }
+  } catch { /* ignore */ }
+  return bodyText.slice(0, maxLen);
+}
+
+/** 始终输出的响应内容预览（不依赖 CCR_TRACE / CCR_TRACE_CONSOLE） */
+function consolePreview(record: TraceRecord): void {
+  const phase = String(record.phase || "");
+  const reqId = typeof record.reqId === "string" ? record.reqId : "";
+  const previewMaxChars = asNumberEnv("CCR_RESPONSE_PREVIEW_CHARS", 250);
+  const sseFlushChars = asNumberEnv("CCR_SSE_PREVIEW_FLUSH_CHARS", 150);
+  const ts = new Date().toTimeString().slice(0, 8); // HH:MM:SS
+
+  // ── 非流式 JSON 响应预览 ──────────────────────────────────────────
+  if (phase === "json_to_client" && record.bodyText) {
+    const bodyStr = String(record.bodyText);
+    const preview = extractJsonPreview(bodyStr, previewMaxChars);
+    const ellipsis = bodyStr.length > previewMaxChars ? "..." : "";
+    console.log(`[${ts}] [CCR] resp_preview ${reqId} | ${preview}${ellipsis}`);
+    return;
+  }
+
+  // ── 流式 SSE chunk 预览（只取 sse_to_client，避免 upstream_sse 重复）──
+  const isPreviewChunk = phase === "sse_to_client:chunk";
+  const isPreviewDone  = phase === "sse_to_client:done" || phase === "sse_to_client:cancel";
+
+  if (isPreviewChunk && record.text) {
+    const bufKey = reqId || "default";
+    const buf = ssePreviewBuffers.get(bufKey) ?? { text: "", lastFlushAt: Date.now() };
+    buf.text += extractSseText(String(record.text));
+    if (buf.text.length >= sseFlushChars) {
+      const out = buf.text.slice(0, previewMaxChars);
+      const ellipsis = buf.text.length > previewMaxChars ? "..." : "";
+      console.log(`[${ts}] [CCR] stream_chunk ${reqId} | ${out}${ellipsis}`);
+      buf.text = "";
+      buf.lastFlushAt = Date.now();
+    }
+    ssePreviewBuffers.set(bufKey, buf);
+    return;
+  }
+
+  if (isPreviewDone) {
+    const bufKey = reqId || "default";
+    const buf = ssePreviewBuffers.get(bufKey);
+    if (buf && buf.text.trim()) {
+      const out = buf.text.slice(0, previewMaxChars);
+      const ellipsis = buf.text.length > previewMaxChars ? "..." : "";
+      console.log(`[${ts}] [CCR] stream_chunk ${reqId} | ${out}${ellipsis} [end]`);
+    }
+    ssePreviewBuffers.delete(bufKey);
+  }
+}
+
 function consoleLog(record: TraceRecord, maxLen = 300): void {
   const phase = String(record.phase || "unknown");
   const ts = String(record.ts || new Date().toISOString());
@@ -237,34 +321,35 @@ function consoleLog(record: TraceRecord, maxLen = 300): void {
 }
 
 export function traceLog(record: TraceRecord): void {
+  // ── 文件写入（只在 CCR_TRACE 启用时进行）──────────────────────────
   const out = getStream();
-  if (!out) return;
+  if (out) {
+    const { stream, opts } = out;
+    const enriched: TraceRecord = {
+      ts: new Date().toISOString(),
+      ...record,
+    };
 
-  const { stream, opts } = out;
-  const enriched: TraceRecord = {
-    ts: new Date().toISOString(),
-    ...record,
-  };
+    const safe = truncateDeep(enriched, opts.maxFieldLength);
+    try {
+      stream.write(JSON.stringify(safe) + "\n");
+    } catch {
+      stream.write(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          phase: "trace_logger_error",
+          message: "Failed to serialize trace record",
+        }) + "\n"
+      );
+    }
 
-  const safe = truncateDeep(enriched, opts.maxFieldLength);
-  try {
-    stream.write(JSON.stringify(safe) + "\n");
-  } catch {
-    stream.write(
-      JSON.stringify({
-        ts: new Date().toISOString(),
-        phase: "trace_logger_error",
-        message: "Failed to serialize trace record",
-      }) + "\n"
-    );
+    // 可选：开启详细控制台回显
+    if (process.env.CCR_TRACE_CONSOLE === "1") {
+      consoleLog(safe as TraceRecord);
+    }
   }
 
-  // Also echo a truncated version to console for dev visibility (opt-in)
-  if (process.env.CCR_TRACE_CONSOLE === "1") {
-    consoleLog(safe as TraceRecord);
-  }
-
-  // Always log important events to console for operational visibility
+  // ── 始终输出：重要运营事件 ────────────────────────────────────────
   const phase = String(record.phase || "unknown");
   const isImportant = [
     "incoming_request",
@@ -289,6 +374,9 @@ export function traceLog(record: TraceRecord): void {
     
     console.log(consoleMsg);
   }
+
+  // ── 始终输出：响应内容预览 ────────────────────────────────────────
+  consolePreview(record);
 }
 
 // Export a one-time init logger to help verify tracing works at startup
@@ -304,9 +392,8 @@ export async function traceStream(
     meta?: Record<string, unknown>;
   }
 ): Promise<ReadableStream<Uint8Array>> {
-  const out = getStream();
-  if (!out) return params.stream;
-
+  // 始终包裹流：文件写入由 traceLog 内部按需判断，
+  // 但控制台预览（consolePreview）不依赖 CCR_TRACE，必须始终执行。
   const reader = params.stream.getReader();
   const decoder = new TextDecoder();
 

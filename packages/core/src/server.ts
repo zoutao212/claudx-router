@@ -319,7 +319,7 @@ class Server {
               } else {
                 // Model without provider prefix — resolve via providerService
                 // (e.g., "glm-5.1" → provider "yuanjing", targetModel "zai-org/GLM-5.1-FP8")
-                const route = this.providerService?.resolveModelRoute?.(body.model);
+                const route = this.providerService?.resolveModelOrProviderRoute?.(body.model);
                 if (route) {
                   req.provider = route.provider.name;
                   // If the resolved target model differs from the requested model (alias case),
@@ -448,7 +448,7 @@ class Server {
               req.provider = provider;
               req.model = model;
             } else {
-              const route = this.providerService?.resolveModelRoute?.(body.model);
+              const route = this.providerService?.resolveModelOrProviderRoute?.(body.model);
               if (route) {
                 req.provider = route.provider.name;
                 if (route.targetModel !== body.model) {

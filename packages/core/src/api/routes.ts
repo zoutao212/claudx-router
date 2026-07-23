@@ -8,6 +8,7 @@ import { Readable } from "node:stream";
 import { RegisterProviderRequest, LLMProvider } from "@/types/llm";
 import { sendUnifiedRequest } from "@/utils/request";
 import { redactHeaders, traceLog, traceStream, traceInit } from "@/utils/trace-logger";
+import { getRuntimeEvents, recordRuntimeEvent } from "@/utils/runtime-events";
 import { createApiError } from "./middleware";
 import { version } from "../../package.json";
 import { ConfigService } from "@/services/config";
@@ -41,6 +42,8 @@ export async function handleTransformerEndpoint(
   transformer: any
 ) {
   const body = req.body as any;
+  const requestStartedAt = Date.now();
+  const requestId = (req as any).id as string | undefined;
   
   // Defensive: if req.provider contains a "/" it means the preHandler didn't split it
   // (e.g., "opencode/deepseek-v4-flash" should be provider="opencode", model="deepseek-v4-flash")
@@ -65,6 +68,15 @@ export async function handleTransformerEndpoint(
   
   const provider = fastify.providerService.getProvider(providerName);
 
+  recordRuntimeEvent({
+    level: "info",
+    requestId,
+    provider: providerName,
+    model: body?.model,
+    message: "收到 API 请求",
+    detail: `${req.method} ${req.url} · 输入格式 ${transformer.name}`,
+  });
+
   traceLog({
     phase: "inbound_request",
     reqId: (req as any).id,
@@ -78,6 +90,15 @@ export async function handleTransformerEndpoint(
 
   // Validate provider exists
   if (!provider) {
+    recordRuntimeEvent({
+      level: "error",
+      requestId,
+      provider: providerName,
+      model: body?.model,
+      message: "未找到 Provider",
+      detail: "请求未发送到上游。",
+      durationMs: Date.now() - requestStartedAt,
+    });
     throw createApiError(
       `Provider '${providerName}' not found`,
       404,
@@ -111,6 +132,24 @@ export async function handleTransformerEndpoint(
       }
     );
 
+    recordRuntimeEvent({
+      level: "info",
+      requestId,
+      provider: providerName,
+      model: requestBody.model,
+      message: "已转换 API 格式",
+      detail: `${transformer.name} → ${provider.transformer?.use?.map((item: Transformer) => item.name).join(", ") || transformer.name}`,
+    });
+
+    recordRuntimeEvent({
+      level: "info",
+      requestId,
+      provider: providerName,
+      model: requestBody.model,
+      message: "正在请求上游",
+      detail: String(config.url || provider.baseUrl),
+    });
+
     // Send request to LLM provider
     const response = await sendRequestToProvider(
       requestBody,
@@ -123,6 +162,16 @@ export async function handleTransformerEndpoint(
         req,
       }
     );
+
+    recordRuntimeEvent({
+      level: response.ok ? "success" : "error",
+      requestId,
+      provider: providerName,
+      model: requestBody.model,
+      message: "收到上游响应",
+      detail: `${response.status} ${response.statusText || ""}`.trim(),
+      durationMs: Date.now() - requestStartedAt,
+    });
 
     traceLog({
       phase: "provider_response_headers",
@@ -154,9 +203,28 @@ export async function handleTransformerEndpoint(
       contentType: finalResponse.headers?.get?.("Content-Type"),
     });
 
+    recordRuntimeEvent({
+      level: "success",
+      requestId,
+      provider: providerName,
+      model: requestBody.model,
+      message: body.stream ? "已转发流式响应" : "已完成响应转换",
+      detail: `输出格式 ${transformer.name}`,
+      durationMs: Date.now() - requestStartedAt,
+    });
+
     // Format and return response
     return formatResponse(finalResponse, reply, body, release);
   } catch (error: any) {
+    recordRuntimeEvent({
+      level: "error",
+      requestId,
+      provider: providerName,
+      model: body?.model,
+      message: "请求失败",
+      detail: String(error?.message || error).slice(0, 240),
+      durationMs: Date.now() - requestStartedAt,
+    });
     // Handle fallback if error occurs
     if (error.code === 'provider_response_error') {
       const fallbackResult = await handleFallback(req, reply, fastify, transformer, error);
@@ -356,11 +424,19 @@ async function processRequestTransformers(
       ) {
         continue;
       }
-      requestBody = await modelTransformer.transformRequestIn(
+      const transformIn = await modelTransformer.transformRequestIn(
         requestBody,
         provider,
         context
       );
+      // Same unwrap contract as provider-level transformers:
+      // { body, config } rewrites both payload and upstream URL/headers.
+      if (transformIn?.body) {
+        requestBody = transformIn.body;
+        config = { ...config, ...transformIn.config };
+      } else {
+        requestBody = transformIn;
+      }
     }
   }
 
@@ -806,6 +882,11 @@ export const registerApiRoutes = async (
 
   fastify.get("/health", async () => {
     return { status: "ok", timestamp: new Date().toISOString() };
+  });
+
+  fastify.get("/api/runtime-events", async (request: FastifyRequest) => {
+    const query = request.query as { limit?: string };
+    return { events: getRuntimeEvents(Number(query.limit) || 100) };
   });
 
   // Concurrency status endpoint — shows per-provider concurrency stats

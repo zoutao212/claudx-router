@@ -385,6 +385,24 @@ export class ProviderService {
     };
   }
 
+  resolveModelOrProviderRoute(modelOrProviderName: string): RequestRouteInfo | null {
+    const modelRoute = this.resolveModelRoute(modelOrProviderName);
+    if (modelRoute) {
+      return modelRoute;
+    }
+
+    const provider = this.providers.get(modelOrProviderName);
+    if (!provider || provider.models.length !== 1) {
+      return null;
+    }
+
+    return {
+      provider,
+      originalModel: modelOrProviderName,
+      targetModel: normalizeModelName(provider.models[0]),
+    };
+  }
+
   getAvailableModelNames(): string[] {
     // Return all keys from modelRoutes (includes actual model names + aliases)
     return Array.from(this.modelRoutes.keys());

@@ -3,12 +3,13 @@
   "version": "2.0.0",
   "description": "Use Claude Code without an Anthropics account and route it to another LLM provider",
   "scripts": {
-    "build": "pnpm build:shared && pnpm build:core && pnpm build:server && pnpm build:cli && pnpm build:ui",
+    "build": "pnpm build:shared && pnpm build:core && pnpm build:server && pnpm build:cli && pnpm build:ui && pnpm build:desktop",
     "build:core": "pnpm --filter @musistudio/llms build",
     "build:shared": "pnpm --filter @CCR/shared build",
     "build:cli": "pnpm --filter @CCR/cli build",
     "build:server": "pnpm --filter @CCR/server build",
     "build:ui": "pnpm --filter @CCR/ui build",
+    "build:desktop": "pnpm --filter @CCR/desktop build",
     "build:docs": "pnpm --filter claude-code-router-docs build",
     "release": "pnpm build && bash scripts/release.sh all",
     "release:npm": "bash scripts/release.sh npm",
@@ -16,6 +17,7 @@
     "dev:cli": "pnpm --filter @CCR/cli dev",
     "dev:server": "pnpm --filter @CCR/server dev",
     "dev:ui": "pnpm --filter @CCR/ui dev",
+    "dev:desktop": "pnpm build:shared && pnpm build:server && pnpm --filter @CCR/desktop dev",
     "dev:core": "pnpm --filter @musistudio/llms dev",
     "dev:docs": "pnpm --filter claude-code-router-docs start",
     "serve:docs": "pnpm --filter claude-code-router-docs serve"

@@ -53,7 +53,7 @@ start-prod.bat 8080
 
 在终端中设置：
 ```cmd
-set ANTHROPIC_API_KEY=1dae5bcbef184f759fc41905fc9ea193.oJZieuGHzubT1nCv
+set ANTHROPIC_API_KEY=<your-ccr-api-key>
 set ANTHROPIC_BASE_URL=http://localhost:3457/v1
 ```
 

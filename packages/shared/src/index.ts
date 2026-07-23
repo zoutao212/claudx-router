@@ -1,4 +1,5 @@
 export * from "./constants";
+export * from "./config";
 
 // Export preset-related functionality
 export * from './preset/types';

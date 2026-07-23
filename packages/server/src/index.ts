@@ -614,6 +614,18 @@ async function run() {
     const server = await getServer();
     console.log('Server instance created successfully');
 
+    const serviceStatus = {
+      phase: "starting" as "starting" | "running" | "stopping",
+      endpoint: "",
+      startedAt: new Date().toISOString(),
+    };
+
+    server.app.get("/api/status", async () => ({
+      ok: serviceStatus.phase === "running",
+      ...serviceStatus,
+      pid: process.pid,
+    }));
+
     server.app.post("/api/restart", async () => {
       setTimeout(async () => {
         process.exit(0);
@@ -727,6 +739,8 @@ async function run() {
     // Patch the live config so server.start() — which reads PORT/HOST via
     // configService.get("PORT") — picks up the resolved port. This also
     // neutralizes any initialConfig injection that pointed at a bad port.
+    const healthHost = userHost === "0.0.0.0" || userHost === "::" ? "127.0.0.1" : userHost;
+    serviceStatus.endpoint = `http://${healthHost}:${bindTargetPort}`;
     server.configService.set('PORT', bindTargetPort);
     server.configService.set('HOST', userHost);
     const startPromise = server.start();
@@ -737,6 +751,20 @@ async function run() {
 
     // Start additional protocol listeners if configured
     await server.startListeners();
+    serviceStatus.phase = "running";
+
+    const shutdown = async () => {
+      if (serviceStatus.phase === "stopping") return;
+      serviceStatus.phase = "stopping";
+      try {
+        await server.app.close();
+      } finally {
+        process.exit(0);
+      }
+    };
+
+    process.once("SIGTERM", shutdown);
+    process.once("SIGINT", shutdown);
   } catch (error) {
     console.error('Failed to start server:', error);
     console.error('Error stack:', error instanceof Error ? error.stack : 'No stack trace');

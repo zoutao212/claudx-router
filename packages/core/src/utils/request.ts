@@ -893,7 +893,9 @@ export function sendUnifiedRequest(
 
   const cacheTraceSummary = buildCacheTraceSummary(finalRequest);
   const requestUrl = typeof url === "string" ? url : url.toString();
-  writePerRequestMessageAuditLog(context?.req?.id, finalRequest);
+  if (process.env.CCR_MESSAGE_AUDIT === "1") {
+    writePerRequestMessageAuditLog(context?.req?.id, finalRequest);
+  }
   writeHistoryDiffAuditLog(context?.req?.id, finalRequest, context, requestUrl);
 
   // CACHE_DEBUG: write detailed request body analysis to a separate log file

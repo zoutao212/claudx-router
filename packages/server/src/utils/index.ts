@@ -7,6 +7,7 @@ import {
   DEFAULT_CONFIG,
   HOME_DIR,
   PLUGINS_DIR,
+  writeConfigDocument,
 } from "@CCR/shared";
 
 // Function to interpolate environment variables in config values
@@ -161,9 +162,7 @@ export const backupConfigFile = async () => {
 };
 
 export const writeConfigFile = async (config: any) => {
-  await ensureDir(HOME_DIR);
-  const configWithComment = `${JSON.stringify(config, null, 2)}`;
-  await fs.writeFile(CONFIG_FILE, configWithComment);
+  await writeConfigDocument(config);
 };
 
 export const initConfig = async () => {
