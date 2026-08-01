@@ -107,6 +107,7 @@ const sidebars: SidebarsConfig = {
           },
           items: [
             'server/advanced/custom-router',
+            'server/advanced/openai-responses-prompt-cache-incident',
           ],
         },
       ],
