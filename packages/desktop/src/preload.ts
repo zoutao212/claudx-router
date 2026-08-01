@@ -32,6 +32,28 @@ export interface RuntimeEventSnapshot {
   events: RuntimeEvent[];
 }
 
+export interface RuntimeMetrics {
+  requests: {
+    total: number;
+    successful: number;
+    failed: number;
+    active: number;
+  };
+  tokens: {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    reportedRequests: number;
+  };
+  cacheHitRate: number | null;
+}
+
+export interface RuntimeMetricsSnapshot {
+  metrics: RuntimeMetrics | null;
+}
+
 export interface ConfigWriteResult {
   backupPath?: string;
   revision: string;
@@ -49,6 +71,7 @@ const desktop = {
   openLogs: (): Promise<string> => ipcRenderer.invoke("desktop:open-logs"),
   getConfig: (): Promise<ConfigSnapshot> => ipcRenderer.invoke("desktop:get-config"),
   getRuntimeEvents: (): Promise<RuntimeEventSnapshot> => ipcRenderer.invoke("desktop:get-runtime-events"),
+  getRuntimeMetrics: (): Promise<RuntimeMetricsSnapshot> => ipcRenderer.invoke("desktop:get-runtime-metrics"),
   saveConfig: (config: unknown, revision: string): Promise<ConfigWriteResult> => ipcRenderer.invoke("desktop:save-config", config, revision),
   confirmStop: (): Promise<boolean> => ipcRenderer.invoke("desktop:confirm-stop"),
 };

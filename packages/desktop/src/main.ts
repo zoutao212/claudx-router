@@ -329,6 +329,20 @@ const registerIpc = () => {
     }
     return response.json();
   });
+  ipcMain.handle("desktop:get-runtime-metrics", async () => {
+    const status = supervisor.getStatus();
+    if (status.phase !== "running") return { metrics: null };
+
+    const apiKey = await supervisor.getConfiguredApiKey();
+    const response = await fetch(`${status.endpoint}/api/runtime-metrics`, {
+      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined,
+      signal: AbortSignal.timeout(2_000),
+    });
+    if (!response.ok) {
+      throw new Error(`Could not read runtime metrics: ${response.status}`);
+    }
+    return response.json();
+  });
   ipcMain.handle("desktop:save-config", async (_event, proposedConfig: unknown, revision: string) => {
     const current = await readConfigDocument();
     const merged = preserveConfiguredSecrets(proposedConfig, current.value);

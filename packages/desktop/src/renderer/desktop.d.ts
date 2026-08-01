@@ -30,6 +30,28 @@ export interface RuntimeEventSnapshot {
   events: RuntimeEvent[];
 }
 
+export interface RuntimeMetrics {
+  requests: {
+    total: number;
+    successful: number;
+    failed: number;
+    active: number;
+  };
+  tokens: {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    reportedRequests: number;
+  };
+  cacheHitRate: number | null;
+}
+
+export interface RuntimeMetricsSnapshot {
+  metrics: RuntimeMetrics | null;
+}
+
 export interface ConfigWriteResult {
   backupPath?: string;
   revision: string;
@@ -47,6 +69,7 @@ interface DesktopApi {
   openLogs(): Promise<string>;
   getConfig(): Promise<ConfigSnapshot>;
   getRuntimeEvents(): Promise<RuntimeEventSnapshot>;
+  getRuntimeMetrics(): Promise<RuntimeMetricsSnapshot>;
   saveConfig(config: unknown, revision: string): Promise<ConfigWriteResult>;
   confirmStop(): Promise<boolean>;
 }
