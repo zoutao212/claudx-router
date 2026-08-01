@@ -8,7 +8,14 @@ import { Readable } from "node:stream";
 import { RegisterProviderRequest, LLMProvider } from "@/types/llm";
 import { sendUnifiedRequest } from "@/utils/request";
 import { redactHeaders, traceLog, traceStream, traceInit } from "@/utils/trace-logger";
-import { getRuntimeEvents, recordRuntimeEvent } from "@/utils/runtime-events";
+import {
+  getRuntimeEvents,
+  getRuntimeMetrics,
+  recordRuntimeEvent,
+  recordRuntimeRequestFailed,
+  recordRuntimeRequestStarted,
+  recordRuntimeRequestSucceeded,
+} from "@/utils/runtime-events";
 import { createApiError } from "./middleware";
 import { version } from "../../package.json";
 import { ConfigService } from "@/services/config";
@@ -68,6 +75,7 @@ export async function handleTransformerEndpoint(
   
   const provider = fastify.providerService.getProvider(providerName);
 
+  recordRuntimeRequestStarted(requestId);
   recordRuntimeEvent({
     level: "info",
     requestId,
@@ -99,6 +107,7 @@ export async function handleTransformerEndpoint(
       detail: "请求未发送到上游。",
       durationMs: Date.now() - requestStartedAt,
     });
+    recordRuntimeRequestFailed(requestId);
     throw createApiError(
       `Provider '${providerName}' not found`,
       404,
@@ -107,9 +116,10 @@ export async function handleTransformerEndpoint(
   }
 
   // Acquire concurrency slot for this provider
-  const release = await fastify.providerService.semaphore.acquire(providerName);
+  let release = () => {};
 
   try {
+    release = await fastify.providerService.semaphore.acquire(providerName);
     if (req.url.includes("/v1/v1/")) {
       req.log.warn(
         {
@@ -213,6 +223,8 @@ export async function handleTransformerEndpoint(
       durationMs: Date.now() - requestStartedAt,
     });
 
+    recordRuntimeRequestSucceeded(requestId);
+
     // Format and return response
     return formatResponse(finalResponse, reply, body, release);
   } catch (error: any) {
@@ -227,14 +239,21 @@ export async function handleTransformerEndpoint(
     });
     // Handle fallback if error occurs
     if (error.code === 'provider_response_error') {
-      const fallbackResult = await handleFallback(req, reply, fastify, transformer, error);
-      if (fallbackResult) {
-        // Fallback succeeded — release original provider's slot
-        // (fallback already released its own slot via finally in handleFallback)
-        release();
-        return fallbackResult;
+      try {
+        const fallbackResult = await handleFallback(req, reply, fastify, transformer, error);
+        if (fallbackResult) {
+          recordRuntimeRequestSucceeded(requestId);
+          // Fallback succeeded — release original provider's slot
+          // (fallback already released its own slot via finally in handleFallback)
+          release();
+          return fallbackResult;
+        }
+      } catch (fallbackError) {
+        recordRuntimeRequestFailed(requestId);
+        throw fallbackError;
       }
     }
+    recordRuntimeRequestFailed(requestId);
     throw error;
   } finally {
     // Release concurrency slot only for non-stream responses or errors.
@@ -887,6 +906,10 @@ export const registerApiRoutes = async (
   fastify.get("/api/runtime-events", async (request: FastifyRequest) => {
     const query = request.query as { limit?: string };
     return { events: getRuntimeEvents(Number(query.limit) || 100) };
+  });
+
+  fastify.get("/api/runtime-metrics", async () => {
+    return { metrics: getRuntimeMetrics() };
   });
 
   // Concurrency status endpoint — shows per-provider concurrency stats

@@ -4,6 +4,7 @@ import { redactHeaders, traceLog, traceStream } from "./trace-logger";
 import { createHash } from "node:crypto";
 import { appendFileSync, mkdirSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { recordRuntimeUsage } from "./runtime-events";
 
 let lastRequestBodySha256: string | null = null;
 let lastRequestBodySha256AtMs = 0;
@@ -241,6 +242,7 @@ function appendCacheDebugRecord(record: Record<string, unknown>): void {
 }
 
 export function writeCacheUsageDebug(reqId: string | undefined, usage: Record<string, unknown>, meta: Record<string, unknown> = {}): void {
+  recordRuntimeUsage(reqId, usage);
   if (process.env.CCR_CACHE_DEBUG !== "1") return;
   try {
     const requestSummary = reqId ? cacheDebugRequestSummaries.get(reqId) : undefined;
