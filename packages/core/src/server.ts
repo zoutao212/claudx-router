@@ -150,6 +150,32 @@ class Server {
     console.log('TokenizerService initialization started');
   }
 
+  private resolveRequestedModel(req: FastifyRequest, body: { model: string }): void {
+    const requestedModel = body.model;
+    const route = this.providerService.resolveModelOrProviderRoute(requestedModel);
+
+    if (route) {
+      req.provider = route.provider.name;
+      (req as any).model = [route.targetModel];
+      if (route.targetModel !== requestedModel) {
+        req.log.info(`Model route resolved: "${requestedModel}" → "${route.targetModel}"`);
+        body.model = route.targetModel;
+      }
+      return;
+    }
+
+    if (requestedModel.includes("/")) {
+      const [provider, ...model] = requestedModel.split("/");
+      req.provider = provider;
+      (req as any).model = model;
+      body.model = model.join("/");
+      return;
+    }
+
+    req.provider = requestedModel;
+    (req as any).model = [];
+  }
+
   async register<Options extends FastifyPluginOptions = FastifyPluginOptions>(
     plugin: FastifyPluginAsync<Options> | FastifyPluginCallback<Options>,
     options?: FastifyRegisterOptions<Options>
@@ -310,31 +336,7 @@ class Server {
                 req.log.info(`Model migration: "${originalModel}" → "${body.model}"`);
               }
 
-              // If model contains a slash, it's in "provider/model" format
-              if (body.model.includes("/")) {
-                const [provider, ...model] = body.model.split("/");
-                body.model = model.join("/");
-                req.provider = provider;
-                req.model = model;
-              } else {
-                // Model without provider prefix — resolve via providerService
-                // (e.g., "glm-5.1" → provider "yuanjing", targetModel "zai-org/GLM-5.1-FP8")
-                const route = this.providerService?.resolveModelOrProviderRoute?.(body.model);
-                if (route) {
-                  req.provider = route.provider.name;
-                  // If the resolved target model differs from the requested model (alias case),
-                  // rewrite body.model to the actual model name so the provider receives the correct one
-                  if (route.targetModel !== body.model) {
-                    req.log.info(`Model alias resolved: "${body.model}" → "${route.targetModel}"`);
-                    body.model = route.targetModel;
-                  }
-                  req.model = [route.targetModel];
-                } else {
-                  // Fallback: use the model name as provider (legacy behavior)
-                  req.provider = body.model;
-                  req.model = [];
-                }
-              }
+              this.resolveRequestedModel(req, body);
               return;
             } catch (err) {
               req.log.error({error: err}, "Error in modelProviderMiddleware:");
@@ -442,25 +444,7 @@ class Server {
               body.model = modelMigrations[body.model];
               req.log.info(`Model migration: "${originalModel}" → "${body.model}"`);
             }
-            if (body.model.includes("/")) {
-              const [provider, ...model] = body.model.split("/");
-              body.model = model.join("/");
-              req.provider = provider;
-              req.model = model;
-            } else {
-              const route = this.providerService?.resolveModelOrProviderRoute?.(body.model);
-              if (route) {
-                req.provider = route.provider.name;
-                if (route.targetModel !== body.model) {
-                  req.log.info(`Model alias resolved: "${body.model}" → "${route.targetModel}"`);
-                  body.model = route.targetModel;
-                }
-                req.model = [route.targetModel];
-              } else {
-                req.provider = body.model;
-                req.model = [];
-              }
-            }
+            this.resolveRequestedModel(req, body);
           } catch (err) {
             req.log.error({ error: err }, "Error in listener modelProviderMiddleware");
             return reply.code(500).send({ error: "Internal server error" });

@@ -196,6 +196,13 @@ transformerService.registerTransformer("OpenAI", { name: "OpenAI" } as any);
 transformerService.registerTransformer("deepseek", DeepseekTransformer as any);
 const providerService = new ProviderService(configService, transformerService, { info() {}, warn() {}, error() {} });
 
+const minimaxAliasRoute = providerService.resolveModelOrProviderRoute("minimax-m3-OpenCode");
+assert.equal(minimaxAliasRoute?.provider.name, "minimax-m3-OpenCode");
+assert.equal(minimaxAliasRoute?.targetModel, "minimax-m3");
+const prefixedMinimaxAliasRoute = providerService.resolveModelOrProviderRoute("minimax-m3-OpenCode/minimax-m3-OpenCode");
+assert.equal(prefixedMinimaxAliasRoute?.provider.name, "minimax-m3-OpenCode");
+assert.equal(prefixedMinimaxAliasRoute?.targetModel, "minimax-m3");
+
 const anthropicOpencodeProvider = providerService.getProvider("minimax-m3-OpenCode");
 assert.ok(anthropicOpencodeProvider?.transformer?.use?.some((item: any) => item?.name === "Anthropic"));
 assert.ok(

@@ -177,7 +177,11 @@ export class ProviderService {
     // (`data: { choices: ... }`) and will destroy Anthropic SSE frame boundaries
     // (`event: ...\ndata: ...\n\n`), causing downstream Anthropic conversion to emit DONE only.
     const deepseekTransformerName = "deepseek";
-    if (apiTransformerName !== "Anthropic" && this.transformerService.hasTransformer(deepseekTransformerName)) {
+    if (
+      apiTransformerName !== "Anthropic" &&
+      apiTransformerName.toLowerCase() !== "openai-responses" &&
+      this.transformerService.hasTransformer(deepseekTransformerName)
+    ) {
       const providerLower = providerConfig.name.toLowerCase();
       const baseUrlLower = (providerConfig.api_base_url || "").toLowerCase();
       if (

@@ -24,6 +24,22 @@ import { TransformerService } from "@/services/transformer";
 
 import { Transformer } from "@/types/transformer";
 
+function inferWireFormat(body: any, url: URL | string | undefined): string {
+  let pathname = "";
+  try {
+    pathname = url ? new URL(String(url)).pathname.replace(/\/+$/, "") : "";
+  } catch {
+    pathname = "";
+  }
+
+  if (pathname.endsWith("/responses")) return "openai-responses";
+  if (pathname.endsWith("/chat/completions")) return "OpenAI";
+  if (pathname.endsWith("/messages")) return "Anthropic";
+  if (Array.isArray(body?.input) && !Array.isArray(body?.messages)) return "openai-responses";
+  if (Array.isArray(body?.messages)) return "OpenAI";
+  return "unknown";
+}
+
 // Extend FastifyInstance to include custom services
 declare module "fastify" {
   interface FastifyInstance {
@@ -132,7 +148,7 @@ export async function handleTransformerEndpoint(
     }
 
     // Process request transformer chain
-    const { requestBody, config, bypass } = await processRequestTransformers(
+    const { requestBody, config, bypass, transformerChain } = await processRequestTransformers(
       body,
       provider,
       transformer,
@@ -141,24 +157,6 @@ export async function handleTransformerEndpoint(
         req,
       }
     );
-
-    recordRuntimeEvent({
-      level: "info",
-      requestId,
-      provider: providerName,
-      model: requestBody.model,
-      message: "已转换 API 格式",
-      detail: `${transformer.name} → ${provider.transformer?.use?.map((item: Transformer) => item.name).join(", ") || transformer.name}`,
-    });
-
-    recordRuntimeEvent({
-      level: "info",
-      requestId,
-      provider: providerName,
-      model: requestBody.model,
-      message: "正在请求上游",
-      detail: String(config.url || provider.baseUrl),
-    });
 
     // Send request to LLM provider
     const response = await sendRequestToProvider(
@@ -170,6 +168,7 @@ export async function handleTransformerEndpoint(
       transformer,
       {
         req,
+        transformerChain,
       }
     );
 
@@ -234,7 +233,7 @@ export async function handleTransformerEndpoint(
       provider: providerName,
       model: body?.model,
       message: "请求失败",
-      detail: String(error?.message || error).slice(0, 240),
+      detail: String(error?.message || error),
       durationMs: Date.now() - requestStartedAt,
     });
     // Handle fallback if error occurs
@@ -317,7 +316,7 @@ async function handleFallback(
       fallbackRelease = await fastify.providerService.semaphore.acquire(fallbackProvider);
 
       // Process request transformer chain
-      const { requestBody, config, bypass } = await processRequestTransformers(
+      const { requestBody, config, bypass, transformerChain } = await processRequestTransformers(
         newBody,
         provider,
         transformer,
@@ -333,7 +332,7 @@ async function handleFallback(
         fastify,
         bypass,
         transformer,
-        { req: newReq }
+        { req: newReq, transformerChain }
       );
 
       // Process response transformer chain
@@ -378,6 +377,7 @@ async function processRequestTransformers(
   let requestBody = body;
   let config: any = {};
   let bypass = false;
+  const transformerChain: string[] = [];
 
   // Check if transformers should be bypassed (passthrough mode)
   bypass = shouldBypassTransformers(provider, transformer, body);
@@ -402,7 +402,11 @@ async function processRequestTransformers(
 
   // Execute transformer's transformRequestOut method
   if (!bypass && typeof transformer.transformRequestOut === "function") {
-    const transformOut = await transformer.transformRequestOut(requestBody);
+    const transformOut = await transformer.transformRequestOut(requestBody, {
+      ...context,
+      provider,
+    });
+    transformerChain.push(`${transformer.name}.transformRequestOut`);
     if (transformOut.body) {
       requestBody = transformOut.body;
       config = transformOut.config || {};
@@ -425,6 +429,7 @@ async function processRequestTransformers(
         provider,
         context
       );
+      transformerChain.push(`${providerTransformer.name}.transformRequestIn`);
       if (transformIn.body) {
         requestBody = transformIn.body;
         config = { ...config, ...transformIn.config };
@@ -448,6 +453,7 @@ async function processRequestTransformers(
         provider,
         context
       );
+      transformerChain.push(`${modelTransformer.name}.transformRequestIn`);
       // Same unwrap contract as provider-level transformers:
       // { body, config } rewrites both payload and upstream URL/headers.
       if (transformIn?.body) {
@@ -459,7 +465,7 @@ async function processRequestTransformers(
     }
   }
 
-  return { requestBody, config, bypass };
+  return { requestBody, config, bypass, transformerChain };
 }
 
 /**
@@ -471,12 +477,6 @@ function shouldBypassTransformers(
   transformer: any,
   body: any
 ): boolean {
-  // Never bypass when the request is in Responses API format (from Codex CLI).
-  // These requests need transformRequestOut to convert Responses API → Chat Completions,
-  // and transformRequestIn to rewrite the URL to /chat/completions.
-  if (body.input && !body.messages) {
-    return false;
-  }
   return (
     provider.transformer?.use?.length === 1 &&
     provider.transformer.use[0].name === transformer.name &&
@@ -499,9 +499,14 @@ async function sendRequestToProvider(
   transformer: any,
   context: any
 ) {
+  const transformerChain = Array.isArray(context?.transformerChain)
+    ? [...context.transformerChain]
+    : [];
+
   // Handle authentication in passthrough mode
   if (bypass && typeof transformer.auth === "function") {
     const auth = await transformer.auth(requestBody, provider);
+    transformerChain.push(`${transformer.name}.auth`);
     if (auth.body) {
       requestBody = auth.body;
       let headers = config.headers || {};
@@ -525,6 +530,29 @@ async function sendRequestToProvider(
 
   // Resolve URL after auth processing so that auth can override the URL
   const url = config.url || new URL(provider.baseUrl);
+  const upstreamFormat = inferWireFormat(requestBody, url);
+  const requestId = context?.req?.id as string | undefined;
+  const chainDetail = transformerChain.length > 0
+    ? transformerChain.join(" → ")
+    : "passthrough";
+
+  recordRuntimeEvent({
+    level: "info",
+    requestId,
+    provider: provider.name,
+    model: requestBody.model,
+    message: "已转换 API 格式",
+    detail: `${transformer.name} → ${upstreamFormat} · ${chainDetail}`,
+  });
+
+  recordRuntimeEvent({
+    level: "info",
+    requestId,
+    provider: provider.name,
+    model: requestBody.model,
+    message: "正在请求上游",
+    detail: `${upstreamFormat} · ${String(url)}`,
+  });
 
   // Send HTTP request
   // Prepare headers

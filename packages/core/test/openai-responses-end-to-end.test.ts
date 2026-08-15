@@ -80,23 +80,23 @@ const router = new Server({
     HOST: "127.0.0.1",
     PORT: routerPort,
     providers: [{
-      name: "mock-responses",
+      name: "deepseek-responses-mock",
       api_base_url: `http://127.0.0.1:${upstreamPort}/v1/responses`,
       api_key: "test-key",
       api: "openai-responses",
-      models: ["gpt-cache-e2e"],
+      models: [{ name: "gpt-cache-e2e", alias: "gpt-cache-e2e-alias" }],
     }],
   },
 } as any);
 
-async function postChat(messages: any[]): Promise<string> {
+async function postChat(messages: any[], model = "gpt-cache-e2e"): Promise<string> {
   const response = await fetch(`http://127.0.0.1:${routerPort}/v1/chat/completions`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
     },
     body: JSON.stringify({
-      model: "gpt-cache-e2e",
+      model,
       stream: true,
       messages,
       tools: [{
@@ -118,6 +118,18 @@ async function postChat(messages: any[]): Promise<string> {
   return response.text();
 }
 
+async function postResponses(body: Record<string, any>): Promise<string> {
+  const response = await fetch(`http://127.0.0.1:${routerPort}/v1/responses`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  assert.equal(response.status, 200);
+  return response.text();
+}
+
 try {
   await router.start();
 
@@ -131,8 +143,66 @@ try {
     { role: "assistant", content: "first answer" },
     { role: "user", content: "second question" },
   ]);
+  await postChat(baseMessages, "gpt-cache-e2e-alias");
+  await postChat(baseMessages, "deepseek-responses-mock/gpt-cache-e2e-alias");
 
-  assert.equal(upstreamBodies.length, 2);
+  const nativeInput = [{
+    type: "message",
+    role: "user",
+    content: [{ type: "input_text", text: "native responses request" }],
+  }];
+  const nativeResponse = await postResponses({
+    model: "gpt-cache-e2e-alias",
+    stream: true,
+    input: nativeInput,
+    tools: [{ type: "web_search" }],
+  });
+
+  const provider = (router as any).providerService.getProvider("deepseek-responses-mock");
+  assert.deepEqual(
+    provider.transformer.use.map((item: any) => item.name),
+    ["openai-responses"],
+  );
+
+  const runtimeEventsResponse = await fetch(`http://127.0.0.1:${routerPort}/api/runtime-events?limit=50`);
+  assert.equal(runtimeEventsResponse.status, 200);
+  const runtimeEvents = await runtimeEventsResponse.json() as {
+    events: Array<{ provider?: string; message: string; detail?: string }>;
+  };
+  const nativeUpstreamEvent = runtimeEvents.events.find((event) =>
+    event.provider === "deepseek-responses-mock" &&
+    event.message === "正在请求上游"
+  );
+  assert.equal(
+    nativeUpstreamEvent?.detail,
+    `openai-responses · http://127.0.0.1:${upstreamPort}/v1/responses`,
+  );
+  const nativeTransformEvent = runtimeEvents.events.find((event) =>
+    event.provider === "deepseek-responses-mock" &&
+    event.message === "已转换 API 格式"
+  );
+  assert.equal(
+    nativeTransformEvent?.detail,
+    "openai-responses → openai-responses · openai-responses.auth",
+  );
+
+  const modelsResponse = await fetch(`http://127.0.0.1:${routerPort}/v1/models`);
+  assert.equal(modelsResponse.status, 200);
+  const models = await modelsResponse.json() as { data: Array<{ id: string }> };
+  const modelIds = new Set(models.data.map((model) => model.id));
+  assert.ok(modelIds.has("gpt-cache-e2e-alias"));
+  assert.ok(modelIds.has("deepseek-responses-mock/gpt-cache-e2e-alias"));
+
+  assert.equal(upstreamBodies.length, 5);
+  assert.equal(upstreamBodies[2].model, "gpt-cache-e2e");
+  assert.equal(upstreamBodies[3].model, "gpt-cache-e2e");
+  const native = upstreamBodies[4];
+  assert.equal(native.model, "gpt-cache-e2e");
+  assert.deepEqual(native.input, nativeInput);
+  assert.equal(native.messages, undefined);
+  assert.deepEqual(native.tools, [{ type: "web_search" }]);
+  assert.equal(native.input[0].content[0].type, "input_text");
+  assert.match(nativeResponse, /response\.completed/);
   const [first, second] = upstreamBodies;
   assert.match(first.prompt_cache_key, /^ccr:[a-f0-9]{32}$/);
   assert.equal(second.prompt_cache_key, first.prompt_cache_key);
@@ -154,11 +224,12 @@ try {
     .split("\n")
     .map((line) => JSON.parse(line));
   const requestRecords = records.filter((record) => record.kind === "cache_request_structure");
-  assert.equal(requestRecords.length, 2);
+  assert.equal(requestRecords.length, 5);
   assert.equal(requestRecords[0].summary.format, "responses");
   assert.equal(requestRecords[1].adjacentDiff.section, "input_append");
   assert.equal(requestRecords[1].adjacentDiff.commonInputItems, 1);
   assert.equal(requestRecords[1].adjacentDiff.appendedItems, 2);
+  assert.equal(requestRecords[4].summary.format, "responses");
   assert.equal(
     records.some((record) =>
       record.kind === "cache_usage_attribution" &&

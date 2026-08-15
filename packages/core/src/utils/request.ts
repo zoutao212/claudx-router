@@ -1021,8 +1021,9 @@ export function sendUnifiedRequest(
   lastRequestBodySha256AtMs = nowMs;
 
   const retryMax = Number.parseInt(process.env.CCR_UPSTREAM_RETRY_MAX || "2", 10);
-  const retryTotalMs = Number.parseInt(process.env.CCR_UPSTREAM_RETRY_TOTAL_MS || "5000", 10);
+  const retryTotalMs = Number.parseInt(process.env.CCR_UPSTREAM_RETRY_TOTAL_MS || "70000", 10);
   const retryBaseMs = Number.parseInt(process.env.CCR_UPSTREAM_RETRY_BASE_MS || "300", 10);
+  const retryAfterMaxMs = Number.parseInt(process.env.CCR_UPSTREAM_RETRY_AFTER_MAX_MS || "60000", 10);
 
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -1034,6 +1035,32 @@ export function sendUnifiedRequest(
     // and is not safe after the body starts.
     if (ct.includes("text/event-stream")) return false;
     return shouldRetryStatus(response.status);
+  };
+
+  const parseRetryAfterMs = (value: string | null): number | undefined => {
+    if (!value) return undefined;
+    const seconds = Number(value);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1_000);
+
+    const dateMs = Date.parse(value);
+    if (!Number.isFinite(dateMs)) return undefined;
+    return Math.max(0, dateMs - Date.now());
+  };
+
+  const readProviderRetryAfterMs = async (response: Response): Promise<number | undefined> => {
+    const headerDelay = parseRetryAfterMs(response.headers.get("Retry-After"));
+    if (headerDelay !== undefined) return headerDelay;
+
+    const contentType = response.headers.get("Content-Type") || "";
+    if (!contentType.includes("json")) return undefined;
+
+    try {
+      const payload = await response.clone().json() as { retry_after?: unknown };
+      const seconds = Number(payload?.retry_after);
+      return Number.isFinite(seconds) && seconds >= 0 ? Math.ceil(seconds * 1_000) : undefined;
+    } catch {
+      return undefined;
+    }
   };
 
   logger?.debug(
@@ -1064,6 +1091,36 @@ export function sendUnifiedRequest(
         const response = await fetch(requestUrl, fetchOptions);
 
         if (attempt < retryMax && shouldRetryResponse(response)) {
+          const elapsed = Date.now() - startMs;
+          const providerDelay = await readProviderRetryAfterMs(response);
+          const backoffDelay = Math.min(retryBaseMs * Math.pow(2, attempt), 2_000);
+          const delay = providerDelay ?? backoffDelay;
+          const skipReason = providerDelay !== undefined && providerDelay > retryAfterMaxMs
+            ? "provider_retry_after_exceeds_limit"
+            : elapsed + delay > retryTotalMs
+              ? "retry_budget_exhausted"
+              : undefined;
+
+          if (skipReason) {
+            logger?.warn?.(
+              {
+                reqId: context.req.id,
+                bodySha256,
+                retryAttempt: attempt + 1,
+                retryMax,
+                status: response.status,
+                providerRetryAfterMs: providerDelay,
+                retryAfterMaxMs,
+                retryTotalMs,
+                elapsedMs: elapsed,
+                skipReason,
+                requestUrl,
+              },
+              "upstream_retry_skipped"
+            );
+            return response;
+          }
+
           logger?.warn?.(
             {
               reqId: context.req.id,
@@ -1071,15 +1128,12 @@ export function sendUnifiedRequest(
               retryAttempt: attempt + 1,
               retryMax,
               status: response.status,
+              retryDelayMs: delay,
+              providerRetryAfterMs: providerDelay,
               requestUrl,
             },
             "upstream_retry"
           );
-          const elapsed = Date.now() - startMs;
-          const delay = Math.min(retryBaseMs * Math.pow(2, attempt), 2_000);
-          if (elapsed + delay > retryTotalMs) {
-            return response;
-          }
 
           // Drain/close body quickly to free resources before retry
           // IMPORTANT: only do this if we are actually going to retry.
@@ -1094,6 +1148,26 @@ export function sendUnifiedRequest(
         return response;
       } catch (error) {
         if (attempt < retryMax) {
+          const elapsed = Date.now() - startMs;
+          const delay = Math.min(retryBaseMs * Math.pow(2, attempt), 2_000);
+          if (elapsed + delay > retryTotalMs) {
+            logger?.warn?.(
+              {
+                reqId: context.req.id,
+                bodySha256,
+                retryAttempt: attempt + 1,
+                retryMax,
+                retryTotalMs,
+                elapsedMs: elapsed,
+                skipReason: "retry_budget_exhausted",
+                error: error instanceof Error ? error.message : String(error),
+                requestUrl,
+              },
+              "upstream_retry_skipped"
+            );
+            throw error;
+          }
+
           logger?.warn?.(
             {
               reqId: context.req.id,
@@ -1102,16 +1176,12 @@ export function sendUnifiedRequest(
               retryMax,
               retryTotalMs,
               retryBaseMs,
+              retryDelayMs: delay,
               error: error instanceof Error ? error.message : String(error),
               requestUrl,
             },
             "upstream_retry"
           );
-          const elapsed = Date.now() - startMs;
-          const delay = Math.min(retryBaseMs * Math.pow(2, attempt), 2_000);
-          if (elapsed + delay > retryTotalMs) {
-            throw error;
-          }
           await sleep(delay);
           continue;
         }

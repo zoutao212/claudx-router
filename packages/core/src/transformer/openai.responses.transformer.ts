@@ -121,34 +121,56 @@ export class OpenAIResponsesTransformer implements Transformer {
   logger?: any;
   private _encodingWarningLogged = false;
 
+  private isResponsesRequest(request: Record<string, any>): boolean {
+    return !Array.isArray(request?.messages) && (
+      Object.prototype.hasOwnProperty.call(request || {}, "input") ||
+      Object.prototype.hasOwnProperty.call(request || {}, "instructions")
+    );
+  }
+
   /**
-   * Convert incoming request from endpoint format to unified format.
-   * If the request is in Responses API format (has 'input' field, from Codex CLI),
-   * convert it to Chat Completions format.
-   * If the request is already in Chat Completions format (has 'messages' field),
-   * pass it through unchanged.
+   * Adapt the public Responses endpoint to the selected provider transport.
+   * Native Responses providers keep the original wire payload; other providers
+   * receive the existing Chat Completions compatibility conversion.
    */
   async auth(request: any, provider: LLMProvider): Promise<any> {
+    const isResponsesRequest = this.isResponsesRequest(request);
+    const headers = {
+      'Authorization': `Bearer ${provider.apiKey}`,
+      'Content-Type': 'application/json; charset=utf-8',
+      'Accept': 'text/event-stream, application/json, */*',
+    };
+
     return {
       body: request,
       config: {
-        url: this.buildChatCompletionsUrl(provider.baseUrl),
-        headers: {
-          'Authorization': `Bearer ${provider.apiKey}`,
-          'Content-Type': 'application/json; charset=utf-8',
-        },
+        url: isResponsesRequest
+          ? this.buildResponsesUrl(provider.baseUrl)
+          : this.buildChatCompletionsUrl(provider.baseUrl),
+        headers,
       },
     };
   }
 
   async transformRequestOut(
-    request: Record<string, any>
+    request: Record<string, any>,
+    context?: TransformerContext
   ): Promise<UnifiedChatRequest> {
-    // Detect if this is a Responses API format request (from Codex CLI)
-    if (request.input && !request.messages) {
+    const isResponsesRequest = this.isResponsesRequest(request);
+    const providerUsesResponses = context?.provider?.transformer?.use?.some(
+      (item: Transformer) => item?.name === this.name
+    );
+
+    // A Responses endpoint targeting a Responses provider is already in the wire format
+    // required upstream. Preserve it so Responses-only capabilities are not downgraded.
+    if (providerUsesResponses && isResponsesRequest) {
+      return request as UnifiedChatRequest;
+    }
+
+    // Responses clients can still target Chat Completions providers through the endpoint adapter.
+    if (isResponsesRequest) {
       return this.convertResponsesApiToChat(request);
     }
-    // Already in Chat Completions format, pass through
     return request as UnifiedChatRequest;
   }
 
@@ -211,7 +233,6 @@ export class OpenAIResponsesTransformer implements Transformer {
       reasoning,
       temperature: req.temperature,
       max_tokens: req.max_output_tokens,
-      _fromResponsesApi: true,
     } as any;
   }
 
@@ -343,7 +364,7 @@ export class OpenAIResponsesTransformer implements Transformer {
   }
 
   private normalizeResponsesInput(messages: UnifiedMessage[]): any[] {
-    return messages.flatMap((message) => {
+    return messages.flatMap((message): any[] => {
       if (message.role === "system") return [];
       if (message.role === "tool") {
         return [{
@@ -359,6 +380,25 @@ export class OpenAIResponsesTransformer implements Transformer {
       const messageItems = content.length > 0
         ? [{ role: message.role, content }]
         : [];
+      // DeepSeek 在 thinking 模式下要求把上一轮的思维链以 reasoning item 回传，
+      // 否则带 tools 的续传请求会返回 400（reasoning_text must be passed back）。
+      // reasoning item 需要紧邻它所属的 assistant 消息（官方会 merge 进相邻消息）。
+      // 优先取 transformRequestOut 提取的 message.thinking；若客户端回传的 thinking 块
+      // 缺少 signature 导致未被提取，则从 content 数组中的 thinking 块兜底。
+      let thinkingContent: string | undefined =
+        (message as any).thinking?.content;
+      if (!thinkingContent && Array.isArray(message.content)) {
+        const thinkingBlock = (message.content as any[]).find(
+          (block) => block?.type === "thinking" && typeof block.thinking === "string"
+        );
+        thinkingContent = thinkingBlock?.thinking;
+      }
+      const reasoningItems = message.role === "assistant" && thinkingContent
+        ? [{
+            type: "reasoning",
+            content: thinkingContent as string,
+          }]
+        : [];
       const toolItems = message.role === "assistant" && Array.isArray(message.tool_calls)
         ? message.tool_calls.map((tool) => ({
             type: "function_call",
@@ -368,7 +408,7 @@ export class OpenAIResponsesTransformer implements Transformer {
             status: "completed",
           }))
         : [];
-      return [...messageItems, ...toolItems];
+      return [...reasoningItems, ...messageItems, ...toolItems];
     });
   }
 
@@ -451,6 +491,12 @@ export class OpenAIResponsesTransformer implements Transformer {
     context?: TransformerContext
   ): Promise<UnifiedChatRequest | { body: UnifiedChatRequest; config: { url: URL; headers: Record<string, string> } }> {
     const normalizedPath = new URL(provider.baseUrl).pathname.replace(/\/+$/, "");
+    // Provider 是否显式配置了 openai-responses（api: "openai-responses" 或 transformer.use 含 openai-responses）。
+    // 与 transformRequestOut 的判断一致：配置了 openai-responses 就意味着上游应使用 Responses 端点，
+    // 不能仅凭 baseUrl 是否带 /responses 后缀来决定是否透传 Chat Completions 格式。
+    const providerUsesResponses = provider.transformer?.use?.some(
+      (item: Transformer) => item?.name === this.name
+    );
     const responsesHeaders = {
       "Content-Type": "application/json; charset=utf-8",
       "Accept": "text/event-stream, application/json, */*",
@@ -458,21 +504,7 @@ export class OpenAIResponsesTransformer implements Transformer {
       "User-Agent": "claude-code-router/2.0.0",
     };
 
-    if ((request as any)._fromResponsesApi) {
-      const { _fromResponsesApi, ...chatRequest } = request as any;
-      return {
-        body: chatRequest,
-        config: {
-          url: this.buildChatCompletionsUrl(provider.baseUrl),
-          headers: {
-            "Content-Type": "application/json; charset=utf-8",
-            "Accept": "text/event-stream, application/json, */*",
-          },
-        },
-      };
-    }
-
-    if ((request as any).input && !(request as any).messages) {
+    if (this.isResponsesRequest(request as any)) {
       const source = request as any;
       const promptCacheKey = this.getPromptCacheKey(source, context);
       const body = {
@@ -491,7 +523,12 @@ export class OpenAIResponsesTransformer implements Transformer {
       };
     }
 
-    if ((request as any).messages && !(request as any).input && !normalizedPath.endsWith("/responses")) {
+    if (
+      (request as any).messages &&
+      !(request as any).input &&
+      !providerUsesResponses &&
+      !normalizedPath.endsWith("/responses")
+    ) {
       return {
         body: request,
         config: {
@@ -560,6 +597,8 @@ export class OpenAIResponsesTransformer implements Transformer {
           const reader = response.body!.getReader();
           const toolArgsByItemId = new Map<string, string>();
           const toolMetaByItemId = new Map<string, { id: string; name: string }>();
+          // 按 item 累积 DeepSeek 思维链增量文本，供 done 事件做剩余文本补全
+          const reasoningTextByItemId = new Map<string, string>();
 
           // 索引跟踪变量，只有在事件类型切换时才增加索引
           let currentIndex = -1;
@@ -1026,6 +1065,116 @@ export class OpenAIResponsesTransformer implements Transformer {
                             `data: ${JSON.stringify(thinkingChunk)}\n\n`
                           )
                         );
+                      } else if (
+                        data.type === "response.reasoning_text.delta"
+                      ) {
+                        // DeepSeek 的思维链增量事件（事件名与 OpenAI 的
+                        // reasoning_summary_text.delta 不同），同样转成 thinking delta。
+                        // 文本可能位于 delta 或 text 字段（不同实现有差异），兼容两者。
+                        const deltaText =
+                          typeof data.delta === "string" ? data.delta : "";
+                        const textPiece =
+                          typeof data.text === "string" ? data.text : "";
+                        const content = deltaText || textPiece;
+                        if (content && data.item_id) {
+                          reasoningTextByItemId.set(
+                            data.item_id,
+                            (reasoningTextByItemId.get(data.item_id) || "") + content
+                          );
+                        }
+                        const thinkingChunk = {
+                          id: data.item_id || "chatcmpl-" + Date.now(),
+                          object: "chat.completion.chunk",
+                          created: Math.floor(Date.now() / 1000),
+                          model: data.response?.model,
+                          choices: [
+                            {
+                              index: getCurrentIndex(data.type),
+                              delta: {
+                                thinking: {
+                                  content,
+                                },
+                              },
+                              finish_reason: null,
+                            },
+                          ],
+                        };
+
+                        controller.enqueue(
+                          encoder.encode(
+                            `data: ${JSON.stringify(thinkingChunk)}\n\n`
+                          )
+                        );
+                      } else if (
+                        data.type === "response.reasoning_text.done"
+                      ) {
+                        // DeepSeek 思维链结束事件，携带完整文本与 item_id。
+                        // 与 function_call_arguments.done 相同模式：对比已流式发送的
+                        // 增量，只补发剩余文本，再输出带 signature 的收尾 thinking 块。
+                        const finalText =
+                          typeof data.text === "string"
+                            ? data.text
+                            : typeof data.delta === "string"
+                              ? data.delta
+                              : "";
+                        const streamedText = data.item_id
+                          ? reasoningTextByItemId.get(data.item_id) || ""
+                          : "";
+                        const remainingText = finalText.startsWith(streamedText)
+                          ? finalText.slice(streamedText.length)
+                          : finalText;
+                        if (data.item_id) {
+                          reasoningTextByItemId.set(data.item_id, finalText);
+                        }
+
+                        if (remainingText.length > 0) {
+                          const textChunk = {
+                            id: data.item_id || "chatcmpl-" + Date.now(),
+                            object: "chat.completion.chunk",
+                            created: Math.floor(Date.now() / 1000),
+                            model: data.response?.model,
+                            choices: [
+                              {
+                                index: currentIndex,
+                                delta: {
+                                  thinking: {
+                                    content: remainingText,
+                                  },
+                                },
+                                finish_reason: null,
+                              },
+                            ],
+                          };
+                          controller.enqueue(
+                            encoder.encode(
+                              `data: ${JSON.stringify(textChunk)}\n\n`
+                            )
+                          );
+                        }
+
+                        const thinkingChunk = {
+                          id: data.item_id || "chatcmpl-" + Date.now(),
+                          object: "chat.completion.chunk",
+                          created: Math.floor(Date.now() / 1000),
+                          model: data.response?.model,
+                          choices: [
+                            {
+                              index: currentIndex,
+                              delta: {
+                                thinking: {
+                                  ...(data.item_id ? { signature: data.item_id } : {}),
+                                },
+                              },
+                              finish_reason: null,
+                            },
+                          ],
+                        };
+
+                        controller.enqueue(
+                          encoder.encode(
+                            `data: ${JSON.stringify(thinkingChunk)}\n\n`
+                          )
+                        );
                       }
                     } catch (e) {
                       // 改进的错误处理：检查是否是编码问题
@@ -1261,9 +1410,18 @@ export class OpenAIResponsesTransformer implements Transformer {
     let thinking = null;
 
     // 处理推理内容
+    // OpenAI 官方：message item 上带 reasoning 字段；
+    // DeepSeek：独立的 { type: "reasoning", content } item（plain-text content）。
+    const reasoningItem = outputItems.find(
+      (item) => item.type === "reasoning" && typeof (item as any).content === "string"
+    ) as any;
     if (messageOutput && messageOutput.reasoning) {
       thinking = {
         content: messageOutput.reasoning,
+      };
+    } else if (reasoningItem?.content) {
+      thinking = {
+        content: reasoningItem.content,
       };
     }
 
@@ -1422,10 +1580,12 @@ export class OpenAIResponsesTransformer implements Transformer {
 
     // Add reasoning if present
     if (choice.message?.thinking?.content) {
+      // DeepSeek 只支持 plain-text content 的 reasoning item，
+      // 不支持 OpenAI 的 summary[{summary_text}] 结构。
       output.push({
         type: "reasoning",
         id: `rs_${Date.now()}`,
-        summary: [{ type: "summary_text", text: choice.message.thinking.content }],
+        content: choice.message.thinking.content,
       });
     }
 
